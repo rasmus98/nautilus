@@ -40,7 +40,7 @@ class NautilusBound():
     def compute(cls, points, log_l, log_l_min, log_v_target,
                 enlarge_per_dim=1.1, n_points_min=None, split_threshold=100,
                 periodic=None, n_networks=4, neural_network_kwargs={},
-                pool=None, rng=None):
+                pool=None, rng=None, device=None):
         """Compute a union of multiple neural network-based bounds.
 
         Parameters
@@ -78,6 +78,9 @@ class NautilusBound():
             Pool used for parallel processing. Default is None.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        device : str or None, optional
+            Torch device used by the emulator. If None, use scikit-learn.
+            Default is None.
 
         Returns
         -------
@@ -111,7 +114,7 @@ class NautilusBound():
                 points[select], log_l[select], log_l_min,
                 enlarge_per_dim=enlarge_per_dim, n_networks=n_networks,
                 neural_network_kwargs=neural_network_kwargs, pool=pool,
-                rng=rng))
+                rng=rng, device=device))
 
         bound.outer_bound = Union.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
@@ -332,7 +335,7 @@ class NautilusBound():
         group['points'][...] = self.points
 
     @classmethod
-    def read(cls, group, rng=None):
+    def read(cls, group, rng=None, device=None):
         """Read the bound from an HDF5 group.
 
         Parameters
@@ -341,6 +344,9 @@ class NautilusBound():
             HDF5 group to write to.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        device : str or None, optional
+            Torch device used by the emulator. If None, use scikit-learn.
+            Default is None.
 
         Returns
         -------
@@ -367,7 +373,7 @@ class NautilusBound():
         while 'neural_bound_{}'.format(i) in group:
             bound.neural_bounds.append(NeuralBound.read(
                 group['neural_bound_{}'.format(i)],
-                rng=bound.rng))
+                rng=bound.rng, device=device))
             i += 1
 
         bound.outer_bound = Union.read(

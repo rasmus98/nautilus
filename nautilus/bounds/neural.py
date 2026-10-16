@@ -28,7 +28,7 @@ class NeuralBound():
     @classmethod
     def compute(cls, points, log_l, log_l_min, enlarge_per_dim=1.1,
                 n_networks=4, neural_network_kwargs={}, pool=None,
-                rng=None):
+                rng=None, device=None):
         """Compute a neural network-based bound.
 
         Parameters
@@ -51,6 +51,9 @@ class NeuralBound():
             Pool used for parallel processing. Default is None.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        device : str or None, optional
+            Torch device used by the emulator. If None, use scikit-learn.
+            Default is None.
 
         Returns
         -------
@@ -88,7 +91,8 @@ class NeuralBound():
             (rankdata(log_l[~select]) - 0.5) / np.sum(~select))
         bound.emulator = NeuralNetworkEmulator.train(
             points_t, score, n_networks=n_networks,
-            neural_network_kwargs=neural_network_kwargs, pool=pool)
+            neural_network_kwargs=neural_network_kwargs, pool=pool,
+            device=device)
 
         bound.score_predict_min = np.polyval(np.polyfit(
             score, bound.emulator.predict(points_t), 3),
@@ -141,7 +145,7 @@ class NeuralBound():
             self.emulator.write(group.create_group('emulator'))
 
     @classmethod
-    def read(cls, group, rng=None):
+    def read(cls, group, rng=None, device=None):
         """Read the bound from an HDF5 group.
 
         Parameters
@@ -150,6 +154,9 @@ class NeuralBound():
             HDF5 group to write to.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        device : str or None, optional
+            Torch device used by the emulator. If None, use scikit-learn.
+            Default is None.
 
         Returns
         -------
@@ -166,7 +173,8 @@ class NeuralBound():
         bound.score_predict_min = group.attrs['score_predict_min']
         bound.outer_bound = Ellipsoid.read(group['outer_bound'], rng=rng)
         if 'emulator' in group:
-            bound.emulator = NeuralNetworkEmulator.read(group['emulator'])
+            bound.emulator = NeuralNetworkEmulator.read(group['emulator'],
+                                                        device=device)
         else:
             bound.emulator = None
 

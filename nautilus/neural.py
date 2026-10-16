@@ -44,11 +44,15 @@ class NeuralNetworkEmulator():
         coordinates.
     network : sklearn.neural_network.MLPRegressor
         Artifical neural network used for emulation.
+    device : str or None
+        Torch device used for training and prediction. If None, use
+        scikit-learn.
 
     """
 
     @classmethod
-    def train(cls, x, y, n_networks=4, neural_network_kwargs={}, pool=None):
+    def train(cls, x, y, n_networks=4, neural_network_kwargs={}, pool=None,
+              device=None):
         """Initialize and train the likelihood neural network emulator.
 
         Parameters
@@ -64,6 +68,9 @@ class NeuralNetworkEmulator():
             MLPRegressor.
         pool : multiprocessing.Pool, optional
             Pool used for parallel processing.
+        device : str or None, optional
+            Torch device used for training and prediction. If None, use
+            scikit-learn. Default is None.
 
         Returns
         -------
@@ -72,6 +79,7 @@ class NeuralNetworkEmulator():
 
         """
         emulator = cls()
+        emulator.device = device
 
         emulator.mean = np.mean(x, axis=0)
         emulator.scale = np.std(x, axis=0)
@@ -86,6 +94,13 @@ class NeuralNetworkEmulator():
             warnings.warn("The 'random_state' keyword argument passed to the" +
                           " neural network is ignored.", Warning, stacklevel=2)
             del neural_network_kwargs['random_state']
+
+        if device is not None:
+            from ._torch import train_networks
+            emulator.neural_networks = train_networks(
+                (x - emulator.mean) / emulator.scale, y, n_networks,
+                neural_network_kwargs, device)
+            return emulator
 
         f = partial(train_network, (x - emulator.mean) / emulator.scale, y,
                     neural_network_kwargs)
@@ -111,6 +126,9 @@ class NeuralNetworkEmulator():
             Emulated normalized likelihood value of the training points.
 
         """
+        if self.device is not None:
+            from ._torch import predict
+            return predict(self, x)
         return np.mean(
             [network.predict((x - self.mean) / self.scale) for network in
              self.neural_networks], axis=0)
@@ -146,13 +164,16 @@ class NeuralNetworkEmulator():
         group.create_dataset('scale', data=self.scale)
 
     @classmethod
-    def read(cls, group):
+    def read(cls, group, device=None):
         """Read the emulator from an HDF5 group.
 
         Parameters
         ----------
         group : h5py.Group
             HDF5 group to write to.
+        device : str or None, optional
+            Torch device used for prediction. If None, use scikit-learn.
+            Default is None.
 
         Returns
         -------
@@ -161,6 +182,7 @@ class NeuralNetworkEmulator():
 
         """
         emulator = cls()
+        emulator.device = device
 
         emulator.mean = np.array(group['mean'])
         emulator.scale = np.array(group['scale'])

@@ -69,6 +69,9 @@ class Sampler():
         Pool used to parallelize sampler calculations.
     rng : np.random.Generator
         Random number generator of the sampler.
+    device : str or None
+        Torch device used by the neural network emulator. If None, the
+        emulator uses scikit-learn.
     n_like : int
         Total number of likelihood evaluations.
     explored : bool
@@ -126,7 +129,7 @@ class Sampler():
                  likelihood_kwargs=dict(), n_batch=None,
                  n_like_new_bound=None, vectorized=False, pass_dict=None,
                  pool=None, seed=None, blobs_dtype=None, filepath=None,
-                 resume=True):
+                 resume=True, backend='numpy', device=None):
         r"""Initialize the sampler.
 
         Parameters
@@ -223,6 +226,15 @@ class Sampler():
             If True, resume from previous run if `filepath` exists. If False,
             start from scratch and overwrite any previous file. Default is
             True.
+        backend : str, optional
+            Implementation of the neural network emulator. 'numpy' uses
+            scikit-learn. 'torch' trains and evaluates the networks with
+            PyTorch, which must be installed separately, e.g., via
+            ``pip install nautilus-sampler[torch]``. Results are statistically
+            equivalent but not identical. Default is 'numpy'.
+        device : str or None, optional
+            Torch device, e.g., 'cpu' or 'cuda', if `backend` is 'torch'.
+            Default is 'cpu'.
 
         Raises
         ------
@@ -277,6 +289,18 @@ class Sampler():
         self.n_networks = n_networks
 
         self.neural_network_kwargs = neural_network_kwargs
+
+        if backend == 'numpy':
+            if device is not None:
+                raise ValueError(
+                    "The 'device' argument requires backend='torch'.")
+            self.device = None
+        elif backend == 'torch':
+            from . import _torch  # noqa: F401
+            self.device = 'cpu' if device is None else str(device)
+        else:
+            raise ValueError("Unknown backend '{}'.".format(backend))
+
         self.vectorized = vectorized
         self.pass_dict = pass_dict
 
@@ -368,7 +392,8 @@ class Sampler():
                     UnitCube.read(fstream['bound_0'], rng=self.rng), ]
                 for i in range(1, len(self.shell_n)):
                     self.bounds.append(NautilusBound.read(
-                        fstream['bound_{}'.format(i)], rng=self.rng))
+                        fstream['bound_{}'.format(i)], rng=self.rng,
+                        device=self.device))
 
     def run(self, f_live=0.01, n_shell=1, n_eff=10000, n_like_max=np.inf,
             discard_exploration=False, timeout=np.inf, verbose=False):
@@ -1028,7 +1053,7 @@ class Sampler():
                         periodic=self.periodic,
                         n_networks=self.n_networks,
                         neural_network_kwargs=self.neural_network_kwargs,
-                        pool=self.pool_s, rng=self.rng)
+                        pool=self.pool_s, rng=self.rng, device=self.device)
                     bound.sample(1000, return_points=False, pool=self.pool_s)
 
                 # Only accept a new bound if it's smaller.
