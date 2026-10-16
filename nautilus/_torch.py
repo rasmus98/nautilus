@@ -16,8 +16,9 @@ except ImportError as error:
         "backend='torch' requires PyTorch. Install it with "
         "'pip install nautilus-sampler[torch]'.") from error
 
-# Network weights and activations. Ellipsoid algebra stays in float64.
-NN_DTYPE = torch.float32
+# Network weights and activations. Training in float32 lowered the sampling
+# efficiency and biased log Z low on a 33-d test problem, so use float64.
+NN_DTYPE = torch.float64
 # Maximum number of points passed through the networks at once.
 PREDICT_CHUNK = 65536
 
