@@ -11,6 +11,44 @@ from scipy.stats import multivariate_normal
 from .basic import UnitCube, Ellipsoid, UnitCubeEllipsoidMixture
 
 
+def oversample_size(n_needed, n_sample, n_reject, margin=1.2, n_min=1000,
+                    n_max=2**18):
+    """Number of points to draw at once to obtain enough accepted points.
+
+    Rejection sampling with i.i.d. draws does not depend on how many points
+    are drawn at once, so drawing more than needed is exact. Accepted extras
+    are kept for later calls.
+
+    Parameters
+    ----------
+    n_needed : int
+        Number of accepted points still needed.
+    n_sample : int
+        Number of points drawn so far.
+    n_reject : int
+        Number of points rejected so far.
+    margin : float, optional
+        Factor by which to exceed the expected number of draws. Default is
+        1.2.
+    n_min : int, optional
+        Minimum number of points to draw. Default is 1000.
+    n_max : int, optional
+        Maximum number of points to draw, limiting memory use. Default is
+        2**18.
+
+    Returns
+    -------
+    n_draw : int
+        Number of points to draw.
+
+    """
+    if n_sample == 0:
+        return n_min
+    acceptance = (n_sample - n_reject + 1) / (n_sample + 1)
+    return int(min(max(np.ceil(margin * n_needed / acceptance), n_min),
+                   n_max))
+
+
 def ellipsoids_overlap(ellipsoids):
     """Determine if ellipsoids overlap.
 
@@ -102,8 +140,9 @@ class Union():
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
         device : str or None, optional
-            Torch device used to compute the bounds. If None, use numpy.
-            Default is None.
+            If not None, i.e., for the torch backend, compute ellipsoids with
+            `minimum_volume_enclosing_ellipsoid_batched` and sample with
+            `oversample_size` points at once. Default is None.
 
         Raises
         ------
@@ -307,7 +346,11 @@ class Union():
 
         """
         while len(self.points) < n_points:
-            n_sample = 1000
+            if self.device is None:
+                n_sample = 1000
+            else:
+                n_sample = oversample_size(n_points - len(self.points),
+                                           self.n_sample, self.n_reject)
 
             p = np.exp(np.array(self.log_v_all) - logsumexp(self.log_v_all))
             n_per_bound = self.rng.multinomial(n_sample, p)
@@ -388,7 +431,7 @@ class Union():
         group['points'][...] = self.points
 
     @classmethod
-    def read(cls, group, rng=None):
+    def read(cls, group, rng=None, device=None):
         """Read the bound from an HDF5 group.
 
         Parameters
@@ -397,6 +440,9 @@ class Union():
             HDF5 group to write to.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        device : str or None, optional
+            If not None, i.e., for the torch backend, sample with
+            `oversample_size` points at once. Default is None.
 
         Returns
         -------
@@ -405,6 +451,7 @@ class Union():
 
         """
         bound = cls()
+        bound.device = device
 
         if rng is None:
             bound.rng = np.random.default_rng()

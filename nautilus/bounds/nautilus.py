@@ -7,7 +7,7 @@ from threadpoolctl import threadpool_limits
 from .basic import Ellipsoid, UnitCubeEllipsoidMixture
 from .neural import NeuralBound
 from .periodic import PhaseShift
-from .union import Union
+from .union import Union, oversample_size
 
 
 class NautilusBound():
@@ -79,8 +79,9 @@ class NautilusBound():
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
         device : str or None, optional
-            Torch device used by the emulators and to compute the
-            ellipsoids. If None, use scikit-learn and numpy.
+            Torch device used by the emulators. If not None, ellipsoids are
+            computed with `minimum_volume_enclosing_ellipsoid_batched` and
+            sampling draws `oversample_size` points at once.
             Default is None.
 
         Returns
@@ -91,6 +92,7 @@ class NautilusBound():
         """
         bound = cls()
         bound.n_dim = points.shape[1]
+        bound.device = device
 
         if periodic is not None:
             bound.shift = PhaseShift.compute(points[log_l >= log_l_min],
@@ -216,7 +218,12 @@ class NautilusBound():
         if len(self.points) < n_points:
             if pool is None:
                 while len(self.points) < n_points:
-                    n_sample = 1000
+                    if self.device is None:
+                        n_sample = 1000
+                    else:
+                        n_sample = oversample_size(
+                            n_points - len(self.points), self.n_sample,
+                            self.n_reject)
                     points = self.outer_bound.sample(n_sample)
                     in_bound = np.any([bound.contains(points) for bound in
                                        self.neural_bounds], axis=0)
@@ -346,8 +353,9 @@ class NautilusBound():
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
         device : str or None, optional
-            Torch device used by the emulators and to compute the
-            ellipsoids. If None, use scikit-learn and numpy.
+            Torch device used by the emulators. If not None, ellipsoids are
+            computed with `minimum_volume_enclosing_ellipsoid_batched` and
+            sampling draws `oversample_size` points at once.
             Default is None.
 
         Returns
@@ -357,6 +365,7 @@ class NautilusBound():
 
         """
         bound = cls()
+        bound.device = device
 
         if rng is None:
             bound.rng = np.random.default_rng()
@@ -379,7 +388,7 @@ class NautilusBound():
             i += 1
 
         bound.outer_bound = Union.read(
-            group['outer_bound'], rng=rng)
+            group['outer_bound'], rng=rng, device=device)
 
         bound.points = np.array(group['points'])
         bound.n_sample = group.attrs['n_sample']

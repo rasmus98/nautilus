@@ -100,3 +100,27 @@ def test_torch_sampler():
     points, log_w, log_l = sampler.posterior()
     mean = np.average(points, weights=np.exp(log_w), axis=0)
     assert np.all(np.abs(mean - 0.5) < 0.02)
+
+
+def test_oversampling_is_uniform():
+    # Drawing many points at once (torch backend) samples the union of two
+    # overlapping ellipsoids uniformly, like the default backend. This needs
+    # no torch: the device only switches the batch sizing.
+    from nautilus.bounds import Union
+    from nautilus.bounds.union import oversample_size
+    rng = np.random.default_rng(0)
+    points = np.concatenate([rng.normal(0.4, 0.05, size=(500, 2)),
+                             rng.normal(0.55, 0.05, size=(500, 2))])
+    results = []
+    for device in [None, 'cpu']:
+        bound = Union.compute(points, rng=np.random.default_rng(1),
+                              device=device)
+        assert bound.split()
+        x = bound.sample(40000)
+        results.append([np.mean(x, axis=0), np.mean(
+            bound.bounds[0].contains(x) & bound.bounds[1].contains(x))])
+    assert np.allclose(results[0][0], results[1][0], atol=3e-3)
+    assert np.abs(results[0][1] - results[1][1]) < 0.01
+    assert oversample_size(256, 0, 0) == 1000
+    assert oversample_size(256, 10**5, 10**5 - 100) > 10**5
+    assert oversample_size(10**6, 10**5, 10**5 - 100) == 2**18
