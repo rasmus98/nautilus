@@ -77,7 +77,7 @@ class Union():
 
     @classmethod
     def compute(cls, points, enlarge_per_dim=1.1, n_points_min=None,
-                unit=True, bound_class=Ellipsoid, rng=None):
+                unit=True, bound_class=Ellipsoid, rng=None, device=None):
         """Compute the bound.
 
         Upon creation, the bound consists of a single individual bound.
@@ -101,6 +101,9 @@ class Union():
             cube-ellipsoid mixtures.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        device : str or None, optional
+            Torch device used to compute the bounds. If None, use numpy.
+            Default is None.
 
         Raises
         ------
@@ -117,6 +120,7 @@ class Union():
         bound = cls()
         bound.n_dim = points.shape[1]
         bound.enlarge_per_dim = enlarge_per_dim
+        bound.device = device
 
         if n_points_min is None:
             bound.n_points_min = bound.n_dim + 1
@@ -135,7 +139,7 @@ class Union():
         bound.points_bounds = [points]
         bound.bounds = [bound_class.compute(
             points, enlarge_per_dim=enlarge_per_dim,
-            rng=rng)]
+            rng=rng, device=device)]
         bound.log_v_all = np.array([bound.bounds[0].log_v])
         bound.block = np.atleast_1d(len(points) < 2 * bound.n_points_min)
 
@@ -201,7 +205,7 @@ class Union():
         for label in [0, 1]:
             new_bounds.append(type(self.bounds[0]).compute(
                 points[labels == label], enlarge_per_dim=self.enlarge_per_dim,
-                rng=self.rng))
+                rng=self.rng, device=self.device))
 
         if not allow_overlap and ellipsoids_overlap(
                 self.bounds[:index] + self.bounds[index+1:] + new_bounds):

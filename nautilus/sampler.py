@@ -227,11 +227,12 @@ class Sampler():
             start from scratch and overwrite any previous file. Default is
             True.
         backend : str, optional
-            Implementation of the neural network emulator. 'numpy' uses
-            scikit-learn. 'torch' trains and evaluates the networks with
-            PyTorch, which must be installed separately, e.g., via
-            ``pip install nautilus-sampler[torch]``. Results are statistically
-            equivalent but not identical. Default is 'numpy'.
+            Implementation of the bound calculations. 'numpy' uses
+            scikit-learn and numpy. 'torch' trains and evaluates the neural
+            networks with PyTorch, which must be installed separately, e.g.,
+            via ``pip install nautilus-sampler[torch]``, and fits ellipsoids
+            with `minimum_volume_enclosing_ellipsoid_batched`. Results are
+            statistically equivalent but not identical. Default is 'numpy'.
         device : str or None, optional
             Torch device, e.g., 'cpu' or 'cuda', if `backend` is 'torch'.
             Default is 'cpu'.

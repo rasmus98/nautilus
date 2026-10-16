@@ -52,7 +52,8 @@ class NeuralBound():
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
         device : str or None, optional
-            Torch device used by the emulator. If None, use scikit-learn.
+            Torch device used by the emulator and the outer ellipsoid. If
+            None, use scikit-learn and numpy.
             Default is None.
 
         Returns
@@ -70,7 +71,7 @@ class NeuralBound():
         # Determine the outer bound.
         bound.outer_bound = Ellipsoid.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
-            rng=rng)
+            rng=rng, device=device)
 
         if n_networks == 0:
             bound.emulator = None
@@ -155,7 +156,8 @@ class NeuralBound():
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
         device : str or None, optional
-            Torch device used by the emulator. If None, use scikit-learn.
+            Torch device used by the emulator and the outer ellipsoid. If
+            None, use scikit-learn and numpy.
             Default is None.
 
         Returns

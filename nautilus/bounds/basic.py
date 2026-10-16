@@ -241,6 +241,85 @@ def minimum_volume_enclosing_ellipsoid(points, n_max=100, n_batch=20):
     return c, A, A_inv
 
 
+def minimum_volume_enclosing_ellipsoid_batched(points, n_max=100, n_batch=20):
+    r"""Find an approximation to the MVEE with fewer, larger operations.
+
+    This function implements the same algorithm and gives the same result as
+    `minimum_volume_enclosing_ellipsoid`, up to floating-point rounding. Each
+    iteration evaluates all points with one matrix product instead of
+    materialising their outer products. The `n_batch` sequential rank-one
+    updates of an iteration are resolved on the small Gram matrix of the
+    selected points (Sherman-Morrison) and then applied at once.
+
+    Parameters
+    ----------
+    points : numpy.ndarray with shape (n_points, n_dim)
+        A 2-D array where each row represents a point.
+    n_max : int, optional
+        Maximum number of iterations before the function is stopped. Default
+        is 100.
+    n_batch : int, optional
+        The number of points to evaluate simultaneously. Default is 20.
+
+    Returns
+    -------
+    c : numpy.ndarray
+        The position of the ellipsoid.
+    A : numpy.ndarray
+        The bounds of the ellipsoid in matrix form, i.e.
+        :math:`(x - c)^T A (x - c) \leq 1`.
+    A_inv : numpy.ndarray
+        The inverse of `A`.
+
+    """
+    n_points, n_dim = points.shape
+    n_batch = min(n_batch, n_points)
+    q = np.append(points, np.ones(shape=(n_points, 1)), axis=1)
+    u = np.repeat(1.0 / n_points, n_points)
+    v = (q.T * u) @ q
+
+    for i in range(n_max):
+        q_v_inv = q @ invert_symmetric_positive_semidefinite_matrix(v)
+        g = np.einsum('ij,ij->i', q_v_inv, q)
+        idx = np.argpartition(g, -n_batch)[-n_batch:]
+        idx = idx[np.argsort(g[idx])[::-1]]
+        q_b = q[idx]
+        gram = q_v_inv[idx] @ q_b.T
+
+        # Sequential updates. Column k of the Gram matrix after the first k
+        # updates is s_k * h_k, h_k = gram_k - sum_{m<k} gamma_m h_m h_m[k].
+        a = np.zeros(n_batch)
+        h = np.zeros((n_batch, n_batch))
+        gamma = np.zeros(n_batch)
+        s = 1.0
+        for k in range(n_batch):
+            h_k = gram[:, k] - h[:, :k] @ (gamma[:k] * h[k, :k])
+            g_k = s * h_k[k]
+            if g_k < n_dim + 1:
+                continue
+            a[k] = (g_k - (n_dim + 1)) / ((n_dim + 1) * (g_k - 1))
+            h[:, k] = h_k
+            gamma[k] = a[k] / (1 - a[k] + a[k] * g_k) * s
+            s /= 1 - a[k]
+
+        # v <- prod_k (1 - a_k) v + sum_k a_k prod_{l>k} (1 - a_l) q_k q_k^T
+        keep = np.cumprod((1 - a)[::-1])[::-1]
+        w = a * np.append(keep[1:], 1.0)
+        v = keep[0] * v + (q_b.T * w) @ q_b
+        u *= keep[0]
+        u[idx] += w
+
+    c = np.atleast_1d(np.average(points, weights=u, axis=0))
+    A_inv = np.atleast_2d(np.cov(points, aweights=u, rowvar=False, bias=True))
+    A = np.linalg.inv(A_inv)
+
+    scale = np.amax(np.einsum('...i,ij,...j', points - c, A, points - c))
+    A /= scale
+    A_inv *= scale
+
+    return c, A, A_inv
+
+
 class Ellipsoid():
     r"""Ellipsoid bound.
 
@@ -263,7 +342,7 @@ class Ellipsoid():
     """
 
     @classmethod
-    def compute(cls, points, enlarge_per_dim=1.1, rng=None):
+    def compute(cls, points, enlarge_per_dim=1.1, rng=None, device=None):
         """Compute the bound.
 
         Parameters
@@ -275,6 +354,10 @@ class Ellipsoid():
             Default is 1.1.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        device : str or None, optional
+            If not None, i.e., for the torch backend, the ellipsoid is computed
+            with `minimum_volume_enclosing_ellipsoid_batched`. Default is
+            None.
 
         Raises
         ------
@@ -300,8 +383,12 @@ class Ellipsoid():
                              'dimensions.')
 
         with threadpool_limits(limits=1):
-            bound.c, bound.A, A_inv = minimum_volume_enclosing_ellipsoid(
-                points)
+            if device is None:
+                bound.c, bound.A, A_inv = minimum_volume_enclosing_ellipsoid(
+                    points)
+            else:
+                bound.c, bound.A, A_inv = \
+                    minimum_volume_enclosing_ellipsoid_batched(points)
 
         bound.A /= enlarge_per_dim**2.0
         A_inv *= enlarge_per_dim**2.0
@@ -469,7 +556,7 @@ class UnitCubeEllipsoidMixture():
     """
 
     @classmethod
-    def compute(cls, points, enlarge_per_dim=1.1, rng=None):
+    def compute(cls, points, enlarge_per_dim=1.1, rng=None, device=None):
         """Compute the bound.
 
         Parameters
@@ -481,6 +568,10 @@ class UnitCubeEllipsoidMixture():
             Default is 1.1.
         rng: None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        device : str or None, optional
+            If not None, i.e., for the torch backend, the ellipsoid is computed
+            with `minimum_volume_enclosing_ellipsoid_batched`. Default is
+            None.
 
         Returns
         -------
@@ -491,7 +582,7 @@ class UnitCubeEllipsoidMixture():
         bound = cls()
         bound.n_dim = points.shape[1]
 
-        kwargs = dict(enlarge_per_dim=enlarge_per_dim, rng=rng)
+        kwargs = dict(enlarge_per_dim=enlarge_per_dim, rng=rng, device=device)
 
         # First, start by sampling all dimensions using an ellipsoid..
         ellipsoid = Ellipsoid.compute(points, **kwargs)

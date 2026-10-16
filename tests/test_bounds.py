@@ -439,3 +439,16 @@ def test_nautilus_bound_reset_and_sample(random_points_from_hypercube, n_jobs):
 
     assert np.all(points_1 == points_2)
     assert volume_1 == volume_2
+
+
+@pytest.mark.parametrize("n_points,n_dim", [(5, 3), (100, 1), (300, 10),
+                                            (500, 33)])
+def test_minimum_volume_enclosing_ellipsoid_batched(n_points, n_dim):
+    # The batched MVEE matches the reference implementation up to rounding.
+    rng = np.random.default_rng(n_dim)
+    points = rng.normal(size=(n_points, n_dim)) @ rng.normal(
+        size=(n_dim, n_dim)) + rng.random(n_dim)
+    for a, b in zip(
+            bounds.basic.minimum_volume_enclosing_ellipsoid(points),
+            bounds.basic.minimum_volume_enclosing_ellipsoid_batched(points)):
+        assert np.allclose(a, b, rtol=1e-9, atol=1e-12 * np.amax(np.abs(a)))

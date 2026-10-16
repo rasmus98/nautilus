@@ -79,7 +79,8 @@ class NautilusBound():
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
         device : str or None, optional
-            Torch device used by the emulator. If None, use scikit-learn.
+            Torch device used by the emulators and to compute the
+            ellipsoids. If None, use scikit-learn and numpy.
             Default is None.
 
         Returns
@@ -103,7 +104,7 @@ class NautilusBound():
         multi_ellipsoid = Union.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
             n_points_min=n_points_min, bound_class=Ellipsoid,
-            rng=rng)
+            rng=rng, device=device)
 
         while multi_ellipsoid.split(allow_overlap=False):
             pass
@@ -119,7 +120,7 @@ class NautilusBound():
         bound.outer_bound = Union.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
             n_points_min=n_points_min, bound_class=UnitCubeEllipsoidMixture,
-            rng=rng)
+            rng=rng, device=device)
 
         # If the single bounding ellipsoid is too large, split ellipsoids
         # further.
@@ -345,7 +346,8 @@ class NautilusBound():
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
         device : str or None, optional
-            Torch device used by the emulator. If None, use scikit-learn.
+            Torch device used by the emulators and to compute the
+            ellipsoids. If None, use scikit-learn and numpy.
             Default is None.
 
         Returns

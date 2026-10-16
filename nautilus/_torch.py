@@ -214,3 +214,4 @@ def predict(emulator, x):
     if is_numpy:
         return y.cpu().numpy().astype(np.float64)
     return y.double()
+
