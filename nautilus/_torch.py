@@ -7,6 +7,8 @@ in, the neural network-based bounds. Results are statistically, not bitwise,
 equivalent to the default numpy/scikit-learn backend.
 """
 
+from functools import partial
+
 import numpy as np
 from scipy.special import logsumexp
 from sklearn.neural_network import MLPRegressor
@@ -26,6 +28,10 @@ except ImportError as error:
 NN_DTYPE = torch.float64
 # Maximum number of points passed through the networks at once.
 PREDICT_CHUNK = 65536
+# Maximum number of minibatch steps per CUDA graph. An epoch is captured as
+# consecutive graphs sharing one memory pool, which bounds the pool to the
+# temporaries of this many steps instead of a whole epoch.
+GRAPH_STEPS = 16
 # Training epochs between host checks of whether all networks stopped, on
 # CUDA devices, where each check waits for the device. Stopped networks are
 # frozen, so the extra epochs do not change the result.
@@ -117,17 +123,20 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
     best_loss = torch.full((n_networks, ), np.inf, dtype=NN_DTYPE,
                            device=device)
     no_improvement = torch.zeros(n_networks, dtype=torch.long, device=device)
+    loss_sum = torch.empty(n_networks, dtype=NN_DTYPE, device=device)
     loss_epoch = torch.empty(n_networks, dtype=NN_DTYPE, device=device)
     active_curve = torch.zeros((network.max_iter, n_networks),
                                dtype=torch.bool, device=device)
     loss_curve = torch.zeros((network.max_iter, n_networks), dtype=NN_DTYPE,
                              device=device)
 
-    def epoch():
+    def steps(k_0, k_1):
         # Adam exactly as in scikit-learn, frozen for stopped networks.
         mask = active.to(NN_DTYPE)[:, None, None]
-        loss_sum = torch.zeros(n_networks, dtype=NN_DTYPE, device=device)
-        for k, (start, stop) in enumerate(slices):
+        if k_0 == 0:
+            loss_sum.zero_()
+        for k in range(k_0, k_1):
+            start, stop = slices[k]
             y_pred = forward(x_perm[:, start:stop])
             loss = 0.5 * torch.mean(
                 (y_pred - y_perm[:, start:stop])**2, dim=1)
@@ -146,7 +155,9 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
                 step = torch._foreach_mul(m, [mask * lr_epoch[k]] * len(m))
                 torch._foreach_div_(step, denom)
                 torch._foreach_sub_(params, step)
-                loss_sum += loss.detach() * (stop - start)
+                loss_sum.add_(loss.detach() * (stop - start))
+        if k_1 < len(slices):
+            return
         # Early stopping as in scikit-learn (tol, n_iter_no_change).
         with torch.no_grad():
             loss_epoch.copy_(loss_sum / n_points)
@@ -157,6 +168,8 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
                 active, torch.fmin(best_loss, loss_epoch), best_loss))
             active.logical_and_(no_improvement <= network.n_iter_no_change)
 
+    epoch = [partial(steps, k, min(k + GRAPH_STEPS, len(slices))) for k in
+             range(0, len(slices), GRAPH_STEPS)]
     replay = None
     check_every = CHECK_EVERY if device.type == 'cuda' else 1
     for epoch_0 in range(0, network.max_iter, check_every):
@@ -179,7 +192,8 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
             elif device.type == 'cuda':
                 replay = capture(epoch)
             else:
-                epoch()
+                for function in epoch:
+                    function()
             loss_curve[i].copy_(loss_epoch)
         if not torch.any(active):
             break
@@ -208,33 +222,45 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
     return networks
 
 
-def capture(function):
-    """Run a function once and return a replay of it as a CUDA graph.
+def capture(functions):
+    """Run functions once and return a replay of them as CUDA graphs.
 
     The first call runs eagerly on a side stream, which also initializes
-    autograd and the BLAS handles, as required before capture. The function
-    must read and write only tensors that persist between calls.
+    autograd and the BLAS handles, as required before capture. Each function
+    is then captured as its own graph. The graphs share one memory pool and
+    are always replayed in order. The functions must read and write only
+    tensors that persist between calls.
 
     Parameters
     ----------
-    function : callable
-        Function without arguments, launching only CUDA kernels.
+    functions : list of callable
+        Functions without arguments, launching only CUDA kernels.
 
     Returns
     -------
     replay : callable
-        Replays the captured kernels.
+        Replays the captured kernels of all functions in order.
 
     """
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        function()
+        for function in functions:
+            function()
     torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        function()
-    return graph.replay
+    graphs = []
+    for function in functions:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=graphs[0].pool() if graphs else
+                              None):
+            function()
+        graphs.append(graph)
+
+    def replay():
+        for graph in graphs:
+            graph.replay()
+
+    return replay
 
 
 def predict(emulator, x):
