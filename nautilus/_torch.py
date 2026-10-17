@@ -2,12 +2,17 @@
 
 This module is imported only when a sampler is created with
 ``backend='torch'``. It provides drop-in replacements for the emulator
-training and prediction. Results are statistically, not bitwise, equivalent
-to the default numpy/scikit-learn backend.
+training and prediction and for drawing points from, and testing membership
+in, the neural network-based bounds. Results are statistically, not bitwise,
+equivalent to the default numpy/scikit-learn backend.
 """
 
 import numpy as np
+from scipy.special import logsumexp
 from sklearn.neural_network import MLPRegressor
+
+from .bounds.basic import Ellipsoid
+from .bounds.union import oversample_size
 
 try:
     import torch
@@ -283,3 +288,154 @@ def predict(emulator, x):
     return y.double()
 
 
+
+def _params(bound, device, keys):
+    """Return attributes of a bound as tensors, cached on the bound."""
+    cache = bound.__dict__.setdefault('_torch_cache', {})
+    if keys not in cache:
+        cache[keys] = [torch.as_tensor(getattr(bound, key), device=device)
+                       for key in keys]
+    return cache[keys]
+
+
+def _transform(ellipsoid, x):
+    """`Ellipsoid.transform` for a tensor."""
+    c, B_inv = _params(ellipsoid, x.device, ('c', 'B_inv'))
+    return (x - c) @ B_inv.T
+
+
+def _contains(bound, x):
+    """`contains` of an ellipsoid or a cube-ellipsoid mixture for a tensor."""
+    if isinstance(bound, Ellipsoid):
+        return torch.sum(_transform(bound, x)**2, dim=-1) < 1
+    in_bound = torch.ones(len(x), dtype=torch.bool, device=x.device)
+    dim_cube, = _params(bound, x.device, ('dim_cube', ))
+    if bound.cube is not None:
+        x_cube = x[:, dim_cube]
+        in_bound &= torch.all((x_cube >= 0) & (x_cube < 1), dim=-1)
+    if bound.ellipsoid is not None:
+        in_bound &= _contains(bound.ellipsoid, x[:, ~dim_cube])
+    return in_bound
+
+
+def _sample(bound, n_points, gen):
+    """`sample` of an ellipsoid or a cube-ellipsoid mixture on a device."""
+    device = gen.device
+    if isinstance(bound, Ellipsoid):
+        c, B = _params(bound, device, ('c', 'B'))
+        x = torch.randn((n_points, bound.n_dim), generator=gen,
+                        dtype=torch.float64, device=device)
+        x /= torch.sqrt(torch.sum(x**2, dim=1, keepdim=True))
+        x *= torch.rand((n_points, 1), generator=gen, dtype=torch.float64,
+                        device=device)**(1.0 / bound.n_dim)
+        return x @ B.T + c
+    x = torch.empty((n_points, bound.n_dim), dtype=torch.float64,
+                    device=device)
+    dim_cube, = _params(bound, device, ('dim_cube', ))
+    if bound.cube is not None:
+        x[:, dim_cube] = torch.rand(
+            (n_points, int(np.sum(bound.dim_cube))), generator=gen,
+            dtype=torch.float64, device=device)
+    if bound.ellipsoid is not None:
+        x[:, ~dim_cube] = _sample(bound.ellipsoid, n_points, gen)
+    return x
+
+
+def _union_sample(union, n_points, gen):
+    """One pass of `Union.sample` on a device, keeping no points in reserve.
+
+    Returns the accepted points of `n_points` draws and updates the union's
+    sampling counters.
+    """
+    p = np.exp(np.array(union.log_v_all) - logsumexp(union.log_v_all))
+    n_per_bound = union.rng.multinomial(n_points, p)
+    x = torch.cat([_sample(bound, int(n), gen) for bound, n in
+                   zip(union.bounds, n_per_bound)])
+    if union.cube is not None:
+        x = x[torch.all((x >= 0) & (x < 1), dim=-1)]
+    x = x[torch.randperm(len(x), generator=gen, device=x.device)]
+    n_bound = sum(_contains(bound, x).to(torch.float64) for bound in
+                  union.bounds)
+    x = x[torch.rand(len(x), generator=gen, dtype=torch.float64,
+                     device=x.device) > 1 - 1.0 / n_bound]
+    union.n_sample += n_points
+    union.n_reject += n_points - len(x)
+    return x
+
+
+def _neural_contains(bound, x):
+    """`NeuralBound.contains` for a tensor."""
+    in_bound = _contains(bound.outer_bound, x)
+    if bound.emulator is not None:
+        idx = torch.nonzero(in_bound)[:, 0]
+        if len(idx) > 0:
+            in_bound[idx] = predict(
+                bound.emulator, _transform(bound.outer_bound, x[idx])) > (
+                    bound.score_predict_min - 1e-9)
+    return in_bound
+
+
+def sample(bound, n_points):
+    """One pass of `NautilusBound.sample` with the points on the device.
+
+    Draws from the outer bound, tests membership in the neural network-based
+    bounds and copies only the accepted points to the host. Random numbers
+    come from a torch generator seeded by the bound's numpy generator.
+
+    Parameters
+    ----------
+    bound : nautilus.bounds.NautilusBound
+        Bound to sample, whose `device` is a torch device.
+    n_points : int
+        Number of points from the outer bound to test.
+
+    Returns
+    -------
+    points : numpy.ndarray
+        Accepted points.
+    n_sample : int
+        Number of points from the outer bound that were tested.
+
+    """
+    gen = torch.Generator(device=bound.device).manual_seed(
+        int(bound.rng.integers(2**63)))
+    union = bound.outer_bound
+    x = _union_sample(union, oversample_size(
+        n_points, union.n_sample, union.n_reject, margin=1, n_min=n_points),
+        gen)
+    in_bound = torch.zeros(len(x), dtype=torch.bool, device=x.device)
+    for neural_bound in bound.neural_bounds:
+        in_bound |= _neural_contains(neural_bound, x)
+    return x[in_bound].cpu().numpy(), len(x)
+
+
+def contains(bound, points):
+    """`NautilusBound.contains`, after any phase shift, on the device.
+
+    Parameters
+    ----------
+    bound : nautilus.bounds.NautilusBound
+        Bound whose `device` is a torch device.
+    points : numpy.ndarray
+        A 1-D or 2-D array of points, each row being a point.
+
+    Returns
+    -------
+    in_bound : bool or numpy.ndarray
+        Whether each point is contained in the bound.
+
+    """
+    x = torch.as_tensor(points, dtype=torch.float64, device=bound.device)
+    x = x.reshape(-1, bound.n_dim)
+    union = bound.outer_bound
+    in_bound = torch.zeros(len(x), dtype=torch.bool, device=x.device)
+    for outer_bound in union.bounds:
+        in_bound |= _contains(outer_bound, x)
+    if union.cube is not None:
+        in_bound &= torch.all((x >= 0) & (x < 1), dim=-1)
+    if len(bound.neural_bounds) > 0:
+        in_neural = torch.zeros_like(in_bound)
+        for neural_bound in bound.neural_bounds:
+            in_neural |= _neural_contains(neural_bound, x)
+        in_bound &= in_neural
+    return in_bound.cpu().numpy().reshape(np.shape(points)[:-1])

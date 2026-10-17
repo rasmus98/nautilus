@@ -167,6 +167,9 @@ class NautilusBound():
         """
         if self.shift is not None:
             points = self.shift.transform(points)
+        if self.device is not None:
+            from .._torch import contains
+            return contains(self, points)
         in_bound = self.outer_bound.contains(points)
         if len(self.neural_bounds) > 0:
             in_bound = in_bound & np.any(
@@ -220,14 +223,15 @@ class NautilusBound():
                 while len(self.points) < n_points:
                     if self.device is None:
                         n_sample = 1000
+                        points = self.outer_bound.sample(n_sample)
+                        in_bound = np.any([bound.contains(points) for bound
+                                           in self.neural_bounds], axis=0)
+                        points = points[in_bound]
                     else:
-                        n_sample = oversample_size(
+                        from .._torch import sample
+                        points, n_sample = sample(self, oversample_size(
                             n_points - len(self.points), self.n_sample,
-                            self.n_reject)
-                    points = self.outer_bound.sample(n_sample)
-                    in_bound = np.any([bound.contains(points) for bound in
-                                       self.neural_bounds], axis=0)
-                    points = points[in_bound]
+                            self.n_reject))
                     self.points = np.vstack([self.points, points])
                     self.n_sample += n_sample
                     self.n_reject += n_sample - len(points)

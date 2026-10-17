@@ -71,7 +71,7 @@ def test_checkpoint_cross_backend(tmp_path, first, second):
                     filepath=tmp_path / 'checkpoint.hdf5', backend=backend)
 
     sampler = Sampler(lambda x: x, likelihood, **kwargs(first))
-    sampler.run(n_like_max=3000, verbose=False)
+    sampler.run(n_like_max=2000, verbose=False)
     n_bounds = len(sampler.bounds)
     assert n_bounds > 2
 
@@ -124,3 +124,66 @@ def test_oversampling_is_uniform():
     assert oversample_size(256, 0, 0) == 1000
     assert oversample_size(256, 10**5, 10**5 - 100) > 10**5
     assert oversample_size(10**6, 10**5, 10**5 - 100) == 2**18
+
+
+def test_device_bound_matches_numpy():
+    # The device versions of NautilusBound.contains and NautilusBound.sample
+    # agree with the numpy versions: identical membership, and uniform draws
+    # with the same volume estimate.
+    pytest.importorskip('torch')
+    from nautilus.bounds import NautilusBound
+    rng = np.random.default_rng(0)
+    points = rng.random((4000, 3))
+    log_l = np.maximum(-np.sum((points - 0.25)**2, axis=1),
+                       -np.sum((points - 0.75)**2, axis=1)) / 0.02
+    bound = NautilusBound.compute(
+        points, log_l, np.quantile(log_l, 0.9), np.log(0.05),
+        n_points_min=50, split_threshold=1, rng=np.random.default_rng(1),
+        device='cpu')
+    assert len(bound.outer_bound.bounds) > 1
+
+    x = rng.random((20000, 3))
+    in_device = bound.contains(x)
+    bound.device = None
+    assert np.array_equal(in_device, bound.contains(x))
+    assert bound.contains(x[0]) == in_device[0]
+
+    results = []
+    for device in [None, 'cpu']:
+        bound.device = device
+        bound.reset(np.random.default_rng(2))
+        x = bound.sample(40000)
+        assert np.all(bound.contains(x))
+        results.append([np.mean(x, axis=0), np.mean(x[:, 0] < 0.5),
+                        bound.log_v])
+    assert np.allclose(results[0][0], results[1][0], atol=4e-3)
+    assert np.abs(results[0][1] - results[1][1]) < 0.015
+    assert np.abs(results[0][2] - results[1][2]) < 0.03
+
+
+def test_device_union_is_uniform():
+    # Device draws from the union of two overlapping ellipsoids are uniform:
+    # same mean and overlap fraction as the numpy draws, and the union volume
+    # estimate agrees.
+    torch = pytest.importorskip('torch')
+    from nautilus import _torch
+    from nautilus.bounds import Union
+    rng = np.random.default_rng(0)
+    points = np.concatenate([rng.normal(0.4, 0.05, size=(500, 2)),
+                             rng.normal(0.55, 0.05, size=(500, 2))])
+    results = []
+    for device in [None, 'cpu']:
+        bound = Union.compute(points, rng=np.random.default_rng(1))
+        assert bound.split()
+        if device is None:
+            x = bound.sample(40000)
+        else:
+            x = _torch._union_sample(
+                bound, 50000, torch.Generator().manual_seed(0)).numpy()
+            assert len(x) > 40000
+        results.append([np.mean(x, axis=0), np.mean(
+            bound.bounds[0].contains(x) & bound.bounds[1].contains(x)),
+            bound.log_v])
+    assert np.allclose(results[0][0], results[1][0], atol=3e-3)
+    assert np.abs(results[0][1] - results[1][1]) < 0.01
+    assert np.abs(results[0][2] - results[1][2]) < 0.01
