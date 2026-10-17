@@ -21,6 +21,10 @@ except ImportError as error:
 NN_DTYPE = torch.float64
 # Maximum number of points passed through the networks at once.
 PREDICT_CHUNK = 65536
+# Training epochs between host checks of whether all networks stopped, on
+# CUDA devices, where each check waits for the device. Stopped networks are
+# frozen, so the extra epochs do not change the result.
+CHECK_EVERY = 4
 
 
 def train_networks(x, y, n_networks, neural_network_kwargs, device):
@@ -91,24 +95,34 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
     y = torch.as_tensor(y, dtype=NN_DTYPE, device=device)
     m = [torch.zeros_like(p) for p in params]
     v = [torch.zeros_like(p) for p in params]
-    active = torch.ones((n_networks, 1, 1), dtype=NN_DTYPE, device=device)
     lr, beta_1, beta_2 = (network.learning_rate_init, network.beta_1,
                           network.beta_2)
     alpha, eps = network.alpha, network.epsilon
+    slices = [(start, min(start + batch_size, n_points)) for start in
+              range(0, n_points, batch_size)]
 
-    n_iter = np.zeros(n_networks, dtype=int)
-    best_loss = np.full(n_networks, np.inf)
-    no_improvement = np.zeros(n_networks, dtype=int)
-    loss_curve = [[] for i in range(n_networks)]
-    t = 0
+    # State read and written by an epoch, kept on the device in fixed buffers
+    # such that an epoch can be replayed as a CUDA graph.
+    x_perm = torch.empty((n_networks, n_points, n_dim), dtype=NN_DTYPE,
+                         device=device)
+    y_perm = torch.empty((n_networks, n_points), dtype=NN_DTYPE,
+                         device=device)
+    lr_epoch = torch.empty(len(slices), dtype=NN_DTYPE, device=device)
+    active = torch.ones(n_networks, dtype=torch.bool, device=device)
+    best_loss = torch.full((n_networks, ), np.inf, dtype=NN_DTYPE,
+                           device=device)
+    no_improvement = torch.zeros(n_networks, dtype=torch.long, device=device)
+    loss_epoch = torch.empty(n_networks, dtype=NN_DTYPE, device=device)
+    active_curve = torch.zeros((network.max_iter, n_networks),
+                               dtype=torch.bool, device=device)
+    loss_curve = torch.zeros((network.max_iter, n_networks), dtype=NN_DTYPE,
+                             device=device)
 
-    for epoch in range(network.max_iter):
-        perm = torch.argsort(torch.rand(
-            (n_networks, n_points), generator=gen, device=device), dim=1)
-        x_perm, y_perm = x[perm], y[perm]
+    def epoch():
+        # Adam exactly as in scikit-learn, frozen for stopped networks.
+        mask = active.to(NN_DTYPE)[:, None, None]
         loss_sum = torch.zeros(n_networks, dtype=NN_DTYPE, device=device)
-        for start in range(0, n_points, batch_size):
-            stop = min(start + batch_size, n_points)
+        for k, (start, stop) in enumerate(slices):
             y_pred = forward(x_perm[:, start:stop])
             loss = 0.5 * torch.mean(
                 (y_pred - y_perm[:, start:stop])**2, dim=1)
@@ -117,8 +131,6 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
                     torch.sum(w**2, dim=(1, 2)) for w in params[::2]) / (
                         stop - start)
             grad = torch.autograd.grad(loss.sum(), params)
-            # Adam exactly as in scikit-learn, frozen for stopped networks.
-            t += 1
             with torch.no_grad():
                 torch._foreach_mul_(m, beta_1)
                 torch._foreach_add_(m, grad, alpha=1 - beta_1)
@@ -126,26 +138,51 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
                 torch._foreach_addcmul_(v, grad, grad, value=1 - beta_2)
                 denom = torch._foreach_sqrt(v)
                 torch._foreach_add_(denom, eps)
-                lr_t = lr * np.sqrt(1 - beta_2**t) / (1 - beta_1**t)
-                torch._foreach_addcdiv_(
-                    params, torch._foreach_mul(m, [active] * len(m)), denom,
-                    value=-lr_t)
+                step = torch._foreach_mul(m, [mask * lr_epoch[k]] * len(m))
+                torch._foreach_div_(step, denom)
+                torch._foreach_sub_(params, step)
                 loss_sum += loss.detach() * (stop - start)
+        # Early stopping as in scikit-learn (tol, n_iter_no_change).
+        with torch.no_grad():
+            loss_epoch.copy_(loss_sum / n_points)
+            no_improvement.copy_(torch.where(active, torch.where(
+                loss_epoch > best_loss - network.tol, no_improvement + 1, 0),
+                no_improvement))
+            best_loss.copy_(torch.where(
+                active, torch.fmin(best_loss, loss_epoch), best_loss))
+            active.logical_and_(no_improvement <= network.n_iter_no_change)
 
-        loss_epoch = (loss_sum / n_points).tolist()
-        for i in np.flatnonzero(active[:, 0, 0].cpu().numpy()):
-            n_iter[i] += 1
-            loss_curve[i].append(loss_epoch[i])
-            if loss_epoch[i] > best_loss[i] - network.tol:
-                no_improvement[i] += 1
+    replay = None
+    check_every = CHECK_EVERY if device.type == 'cuda' else 1
+    for epoch_0 in range(0, network.max_iter, check_every):
+        n_epochs = min(check_every, network.max_iter - epoch_0)
+        t = np.arange(epoch_0 * len(slices) + 1,
+                      (epoch_0 + n_epochs) * len(slices) + 1)
+        lr_block = torch.as_tensor(
+            lr * np.sqrt(1 - beta_2**t) / (1 - beta_1**t), dtype=NN_DTYPE,
+            device=device).view(n_epochs, len(slices))
+        for i in range(epoch_0, epoch_0 + n_epochs):
+            perm = torch.argsort(torch.rand(
+                (n_networks, n_points), generator=gen, device=device), dim=1)
+            torch.index_select(x, 0, perm.view(-1),
+                               out=x_perm.view(-1, n_dim))
+            torch.index_select(y, 0, perm.view(-1), out=y_perm.view(-1))
+            lr_epoch.copy_(lr_block[i - epoch_0])
+            active_curve[i].copy_(active)
+            if replay is not None:
+                replay()
+            elif device.type == 'cuda':
+                replay = capture(epoch)
             else:
-                no_improvement[i] = 0
-            best_loss[i] = min(best_loss[i], loss_epoch[i])
-            if no_improvement[i] > network.n_iter_no_change:
-                active[i] = 0
+                epoch()
+            loss_curve[i].copy_(loss_epoch)
         if not torch.any(active):
             break
 
+    active_curve = active_curve.cpu().numpy()
+    loss_curve = loss_curve.cpu().numpy()
+    best_loss = best_loss.cpu().numpy()
+    n_iter = np.sum(active_curve, axis=0)
     weights = [p.detach().to('cpu', torch.float64).numpy() for p in params]
     networks = []
     for i in range(n_networks):
@@ -158,12 +195,41 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
         network.out_activation_ = 'identity'
         network.n_iter_ = n_iter[i]
         network.t_ = n_iter[i] * n_points
-        network.loss_ = loss_curve[i][-1]
+        network.loss_curve_ = loss_curve[active_curve[:, i], i].tolist()
+        network.loss_ = network.loss_curve_[-1]
         network.best_loss_ = best_loss[i]
-        network.loss_curve_ = loss_curve[i]
         networks.append(network)
 
     return networks
+
+
+def capture(function):
+    """Run a function once and return a replay of it as a CUDA graph.
+
+    The first call runs eagerly on a side stream, which also initializes
+    autograd and the BLAS handles, as required before capture. The function
+    must read and write only tensors that persist between calls.
+
+    Parameters
+    ----------
+    function : callable
+        Function without arguments, launching only CUDA kernels.
+
+    Returns
+    -------
+    replay : callable
+        Replays the captured kernels.
+
+    """
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        function()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        function()
+    return graph.replay
 
 
 def predict(emulator, x):
@@ -215,4 +281,5 @@ def predict(emulator, x):
     if is_numpy:
         return y.cpu().numpy().astype(np.float64)
     return y.double()
+
 
