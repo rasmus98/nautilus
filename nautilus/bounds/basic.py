@@ -5,6 +5,9 @@ from scipy.special import gammaln
 from scipy.linalg.lapack import dpotrf, dpotri
 from threadpoolctl import threadpool_limits
 
+# Recent results of `minimum_volume_enclosing_ellipsoid_batched`.
+_MVEE_CACHE = []
+
 
 class UnitCube():
     r"""Unit (hyper)cube bound.
@@ -272,8 +275,17 @@ def minimum_volume_enclosing_ellipsoid_batched(points, n_max=100, n_batch=20):
         The inverse of `A`.
 
     """
+    # The same points often arrive several times in a row (e.g. the first
+    # ellipsoid of the neural and of the sampling bound), so recent results
+    # are kept.
+    key = (points.shape, n_max, n_batch, hash(points.tobytes()))
+    for cached_key, cached_points, result in _MVEE_CACHE:
+        if cached_key == key and np.array_equal(cached_points, points):
+            return tuple(np.copy(x) for x in result)
+
     n_points, n_dim = points.shape
     n_batch = min(n_batch, n_points)
+    n_1 = n_dim + 1
     q = np.append(points, np.ones(shape=(n_points, 1)), axis=1)
     u = np.repeat(1.0 / n_points, n_points)
     v = (q.T * u) @ q
@@ -293,14 +305,20 @@ def minimum_volume_enclosing_ellipsoid_batched(points, n_max=100, n_batch=20):
         gamma = np.zeros(n_batch)
         s = 1.0
         for k in range(n_batch):
-            h_k = gram[:, k] - h[:, :k] @ (gamma[:k] * h[k, :k])
-            g_k = s * h_k[k]
-            if g_k < n_dim + 1:
+            h_k = h[:, k]
+            if k > 0:
+                np.subtract(gram[:, k], h[:, :k] @ (gamma[:k] * h[k, :k]),
+                            out=h_k)
+            else:
+                h_k[:] = gram[:, 0]
+            g_k = s * float(h_k[k])
+            if g_k < n_1:
+                h_k[:] = 0
                 continue
-            a[k] = (g_k - (n_dim + 1)) / ((n_dim + 1) * (g_k - 1))
-            h[:, k] = h_k
-            gamma[k] = a[k] / (1 - a[k] + a[k] * g_k) * s
-            s /= 1 - a[k]
+            a_k = (g_k - n_1) / (n_1 * (g_k - 1))
+            a[k] = a_k
+            gamma[k] = a_k / (1 - a_k + a_k * g_k) * s
+            s /= 1 - a_k
 
         # v <- prod_k (1 - a_k) v + sum_k a_k prod_{l>k} (1 - a_l) q_k q_k^T
         keep = np.cumprod((1 - a)[::-1])[::-1]
@@ -317,7 +335,9 @@ def minimum_volume_enclosing_ellipsoid_batched(points, n_max=100, n_batch=20):
     A /= scale
     A_inv *= scale
 
-    return c, A, A_inv
+    _MVEE_CACHE.insert(0, (key, np.copy(points), (c, A, A_inv)))
+    del _MVEE_CACHE[4:]
+    return tuple(np.copy(x) for x in (c, A, A_inv))
 
 
 class Ellipsoid():
