@@ -216,3 +216,29 @@ def test_torch_seed_per_bound_resume(tmp_path):
     weights = [b.neural_bounds[0].emulator.neural_networks[0].coefs_[-1]
                for b in full.bounds[1:3]]
     assert not np.allclose(weights[0], weights[1])
+
+
+def test_in_later_bounds_matches_loop():
+    # The batched test of all later bounds in sample_shell agrees with testing
+    # each later bound in turn, including periodic phase shifts and a bound
+    # split into several ellipsoids.
+    pytest.importorskip('torch')
+    from nautilus import _torch
+
+    def likelihood(x):
+        return np.logaddexp(-np.sum((x - 0.3)**2, axis=-1) / 0.005,
+                            -np.sum((x - 0.75)**2, axis=-1) / 0.005)
+
+    sampler = Sampler(lambda x: x, likelihood, n_dim=3, n_live=200,
+                      vectorized=True, seed=0, periodic=[0],
+                      backend='torch')
+    sampler.run(n_like_max=3000, verbose=False)
+    assert len(sampler.bounds) > 4
+    assert all(b.shift is not None for b in sampler.bounds[1:])
+    assert any(len(b.neural_bounds) > 1 for b in sampler.bounds[1:])
+    x = np.random.default_rng(0).random((5000, 3))
+    for index in range(len(sampler.bounds)):
+        loop = np.zeros(len(x), dtype=bool)
+        for bound in sampler.bounds[index + 1:]:
+            loop |= bound.contains(x)
+        assert np.array_equal(_torch.in_later_bounds(sampler, index, x), loop)

@@ -28,6 +28,9 @@ except ImportError as error:
 NN_DTYPE = torch.float64
 # Maximum number of points passed through the networks at once.
 PREDICT_CHUNK = 65536
+# Maximum number of transformed coordinates (points x ellipsoids x
+# dimensions) held at once when testing later bounds in `in_later_bounds`.
+ELLIPSOID_CHUNK = 2**22
 # Maximum number of minibatch steps per CUDA graph. An epoch is captured as
 # consecutive graphs sharing one memory pool, which bounds the pool to the
 # temporaries of this many steps instead of a whole epoch.
@@ -394,13 +397,13 @@ def _union_sample(union, n_points, gen):
 
 def _neural_contains(bound, x):
     """`NeuralBound.contains` for a tensor."""
-    in_bound = _contains(bound.outer_bound, x)
+    x_t = _transform(bound.outer_bound, x)
+    in_bound = torch.sum(x_t**2, dim=-1) < 1
     if bound.emulator is not None:
         idx = torch.nonzero(in_bound)[:, 0]
         if len(idx) > 0:
-            in_bound[idx] = predict(
-                bound.emulator, _transform(bound.outer_bound, x[idx])) > (
-                    bound.score_predict_min - 1e-9)
+            in_bound[idx] = predict(bound.emulator, x_t[idx]) > (
+                bound.score_predict_min - 1e-9)
     return in_bound
 
 
@@ -414,6 +417,137 @@ def _in_any_neural(bounds, x):
             break
         in_any[idx] = _neural_contains(bound, x[idx])
     return in_any
+
+
+def _stack_bounds(sampler):
+    """Ellipsoids of all of a sampler's bounds after the unit cube, stacked.
+
+    Each bound contributes the ellipsoids of its outer bound's cube-ellipsoid
+    mixtures, embedded in the full space with zero rows and columns along the
+    cube dimensions, followed by the outer ellipsoids of its neural bounds.
+    The result is cached on the sampler until its bounds change.
+    """
+    bounds = sampler.bounds[1:]
+    stack = getattr(sampler, '_torch_stack', None)
+    if stack is not None and len(stack['bounds']) == len(bounds) and all(
+            a is b for a, b in zip(stack['bounds'], bounds)):
+        return stack
+    n_dim = sampler.n_dim
+    c, B_inv, dim_cube, owner, start = [], [], [], [], []
+    neural = []
+    for i, bound in enumerate(bounds):
+        start.append(len(c))
+        for mixture in bound.outer_bound.bounds:
+            c.append(np.zeros(n_dim))
+            B_inv.append(np.zeros((n_dim, n_dim)))
+            if mixture.ellipsoid is not None:
+                select = ~mixture.dim_cube
+                c[-1][select] = mixture.ellipsoid.c
+                B_inv[-1][np.ix_(select, select)] = mixture.ellipsoid.B_inv
+            dim_cube.append(mixture.dim_cube)
+            owner.append(i)
+        for neural_bound in bound.neural_bounds:
+            neural.append((len(c), neural_bound))
+            c.append(neural_bound.outer_bound.c)
+            B_inv.append(neural_bound.outer_bound.B_inv)
+            dim_cube.append(np.zeros(n_dim, dtype=bool))
+            owner.append(i)
+    start.append(len(c))
+    device = torch.device(sampler.device)
+    is_neural = np.zeros(len(c), dtype=bool)
+    is_neural[[k for k, _ in neural]] = True
+    sampler._torch_stack = dict(
+        bounds=bounds, start=start, neural=neural,
+        c=torch.as_tensor(np.array(c), device=device),
+        B_inv_T=torch.as_tensor(np.array(B_inv), device=device).transpose(
+            1, 2).contiguous(),
+        dim_cube=torch.as_tensor(np.array(dim_cube), device=device),
+        owner=torch.as_tensor(owner, device=device),
+        is_neural=torch.as_tensor(is_neural, device=device),
+        cube=torch.as_tensor([bound.outer_bound.cube is not None for bound in
+                              bounds], device=device))
+    return sampler._torch_stack
+
+
+def _shift(shift, x):
+    """`PhaseShift.transform` for a tensor."""
+    if shift is None:
+        return x
+    x = x.clone()
+    x[:, shift.periodic] = (x[:, shift.periodic] + torch.as_tensor(
+        -shift.centers + 0.5, device=x.device)) % 1
+    return x
+
+
+def in_later_bounds(sampler, index, points):
+    """Whether points lie in any bound after `index`, on the device.
+
+    Replaces the loop over later bounds in `Sampler.sample_shell`. The
+    ellipsoids of all later bounds are tested in one batched transform.
+    Networks then only see points inside their bound's outer ellipsoid and
+    outer union that no other bound has accepted yet. One copy goes to the
+    device and one back.
+
+    Parameters
+    ----------
+    sampler : nautilus.Sampler
+        Sampler whose `device` is a torch device.
+    index : int
+        Index of the shell; bounds with a larger index are tested.
+    points : numpy.ndarray
+        A 2-D array where each row represents a point.
+
+    Returns
+    -------
+    in_later : numpy.ndarray
+        Bool array describing for each point whether it is contained in any
+        later bound.
+
+    """
+    first = index % len(sampler.bounds)
+    if first == len(sampler.bounds) - 1 or len(points) == 0:
+        return np.zeros(len(points), dtype=bool)
+    stack = _stack_bounds(sampler)
+    bounds = stack['bounds'][first:]
+    k_0 = stack['start'][first]
+    c, B_inv_T, dim_cube, is_neural, cube = (
+        stack['c'][k_0:], stack['B_inv_T'][k_0:], stack['dim_cube'][k_0:],
+        stack['is_neural'][k_0:], stack['cube'][first:])
+    owner = stack['owner'][k_0:] - first
+    neural = [(k - k_0, nb) for k, nb in stack['neural'] if k >= k_0]
+
+    x_all = torch.as_tensor(points, dtype=torch.float64,
+                            device=sampler.device)
+    in_later = torch.zeros(len(x_all), dtype=torch.bool, device=x_all.device)
+    n_rows = max(1, ELLIPSOID_CHUNK // (len(c) * sampler.n_dim))
+    for i in range(0, len(x_all), n_rows):
+        x = x_all[i:i + n_rows]
+        if all(bound.shift is None for bound in bounds):
+            x = x.expand(len(bounds), -1, -1)
+        else:
+            x = torch.stack([_shift(bound.shift, x) for bound in bounds])
+        x_t = torch.bmm(x[owner] - c[:, None], B_inv_T)
+        in_ellipsoid = torch.sum(x_t**2, dim=-1) < 1
+        outside = (x < 0) | (x >= 1)
+        in_mixture = in_ellipsoid & ~is_neural[:, None] & ~torch.any(
+            outside[owner] & dim_cube[:, None], dim=-1)
+        in_union = torch.zeros((len(bounds), x.shape[1]), dtype=torch.float64,
+                               device=x.device).index_add_(
+            0, owner, in_mixture.double()) > 0
+        in_union &= ~(torch.any(outside, dim=-1) & cube[:, None])
+        in_outer = in_ellipsoid & in_union[owner]
+        in_later_i = in_later[i:i + n_rows]
+        for k, neural_bound in neural:
+            if neural_bound.emulator is None:
+                in_later_i |= in_outer[k]
+        for k, neural_bound in neural:
+            if neural_bound.emulator is None:
+                continue
+            idx = torch.nonzero(in_outer[k] & ~in_later_i)[:, 0]
+            if len(idx) > 0:
+                in_later_i[idx] = predict(neural_bound.emulator, x_t[k, idx]) > (
+                    neural_bound.score_predict_min - 1e-9)
+    return in_later.cpu().numpy()
 
 
 def sample(bound, n_points):

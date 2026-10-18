@@ -820,10 +820,14 @@ class Sampler():
 
                 # Remove points that are actually in another shell. Each bound
                 # only tests the points not yet found in a later bound.
-                for bound in self.bounds[index:][1:]:
-                    if len(points) == 0:
-                        break
-                    points = points[~bound.contains(points)]
+                if self.device is not None:
+                    from ._torch import in_later_bounds
+                    points = points[~in_later_bounds(self, index, points)]
+                else:
+                    for bound in self.bounds[index:][1:]:
+                        if len(points) == 0:
+                            break
+                        points = points[~bound.contains(points)]
 
                 # Replace points for which we can use transfer points.
                 replace = np.zeros(len(points), dtype=bool)
