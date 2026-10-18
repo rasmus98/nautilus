@@ -52,7 +52,7 @@ class NeuralNetworkEmulator():
 
     @classmethod
     def train(cls, x, y, n_networks=4, neural_network_kwargs={}, pool=None,
-              device=None):
+              device=None, seed=0):
         """Initialize and train the likelihood neural network emulator.
 
         Parameters
@@ -71,6 +71,10 @@ class NeuralNetworkEmulator():
         device : str or None, optional
             Torch device used for training and prediction. If None, use
             scikit-learn. Default is None.
+        seed : int, optional
+            Seed of the initial weights and the shuffling for the torch
+            backend. Ignored by scikit-learn, whose networks use the seeds
+            0, ..., n_networks - 1. Default is 0.
 
         Returns
         -------
@@ -99,7 +103,7 @@ class NeuralNetworkEmulator():
             from ._torch import train_networks
             emulator.neural_networks = train_networks(
                 (x - emulator.mean) / emulator.scale, y, n_networks,
-                neural_network_kwargs, device)
+                neural_network_kwargs, device, seed)
             return emulator
 
         f = partial(train_network, (x - emulator.mean) / emulator.scale, y,

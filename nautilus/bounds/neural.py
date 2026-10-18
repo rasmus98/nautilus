@@ -90,10 +90,13 @@ class NeuralBound():
             1 + (rankdata(log_l[select]) - 0.5) / np.sum(select))
         score[~select] = 0.5 * (
             (rankdata(log_l[~select]) - 0.5) / np.sum(~select))
+        # The torch backend draws a new seed for every bound from the sampler's
+        # generator; the default backend keeps the fixed seeds of nautilus.
+        seed = None if device is None else int(rng.integers(2**63))
         bound.emulator = NeuralNetworkEmulator.train(
             points_t, score, n_networks=n_networks,
             neural_network_kwargs=neural_network_kwargs, pool=pool,
-            device=device)
+            device=device, seed=seed)
 
         bound.score_predict_min = np.polyval(np.polyfit(
             score, bound.emulator.predict(points_t), 3),

@@ -23,8 +23,8 @@ except ImportError as error:
         "backend='torch' requires PyTorch. Install it with "
         "'pip install nautilus-sampler[torch]'.") from error
 
-# Network weights and activations. Training in float32 lowered the sampling
-# efficiency and biased log Z low on a 33-d test problem, so use float64.
+# Network weights and activations. Initial weights are drawn in float64 and
+# cast, so float32 and float64 training start from the same values.
 NN_DTYPE = torch.float64
 # Maximum number of points passed through the networks at once.
 PREDICT_CHUNK = 65536
@@ -38,7 +38,7 @@ GRAPH_STEPS = 16
 CHECK_EVERY = 4
 
 
-def train_networks(x, y, n_networks, neural_network_kwargs, device):
+def train_networks(x, y, n_networks, neural_network_kwargs, device, seed=0):
     """Train an ensemble of networks like `MLPRegressor` with Adam.
 
     All networks are trained simultaneously as one batched model. Each network
@@ -59,6 +59,8 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
         supported.
     device : str
         Torch device.
+    seed : int, optional
+        Seed of the initial weights and the shuffling. Default is 0.
 
     Returns
     -------
@@ -86,14 +88,15 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device):
         batch_size = int(np.clip(network.batch_size, 1, n_points))
 
     # Weights and biases of all networks, stacked along the first axis.
-    gen = torch.Generator(device=device).manual_seed(0)
+    gen = torch.Generator(device=device).manual_seed(seed)
     params = []
     for fan_in, fan_out in zip(units[:-1], units[1:]):
         bound = np.sqrt(6.0 / (fan_in + fan_out))
         for shape in [(fan_in, fan_out), (1, fan_out)]:
             params.append(torch.empty(
-                (n_networks, ) + shape, dtype=NN_DTYPE, device=device).uniform_(
-                -bound, bound, generator=gen).requires_grad_(True))
+                (n_networks, ) + shape, dtype=torch.float64,
+                device=device).uniform_(-bound, bound, generator=gen).to(
+                NN_DTYPE).requires_grad_(True))
 
     def forward(h):
         for k in range(0, len(params), 2):

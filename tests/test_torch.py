@@ -187,3 +187,32 @@ def test_device_union_is_uniform():
     assert np.allclose(results[0][0], results[1][0], atol=3e-3)
     assert np.abs(results[0][1] - results[1][1]) < 0.01
     assert np.abs(results[0][2] - results[1][2]) < 0.01
+
+
+def test_torch_seed_per_bound_resume(tmp_path):
+    # Each neural bound draws its torch seed from the sampler's generator, so
+    # bounds differ in their initial weights and a run resumed from a
+    # checkpoint repeats the uninterrupted run.
+    pytest.importorskip('torch')
+
+    def likelihood(x):
+        return -np.sum((x - 0.5)**2 / 0.01, axis=-1)
+
+    def sampler(filepath=None):
+        return Sampler(lambda x: x, likelihood, n_dim=3, n_live=200,
+                       vectorized=True, seed=0, filepath=filepath,
+                       backend='torch')
+
+    full = sampler()
+    full.run(n_like_max=3000, verbose=False)
+    part = sampler(tmp_path / 'checkpoint.hdf5')
+    part.run(n_like_max=1500, verbose=False)
+    part = sampler(tmp_path / 'checkpoint.hdf5')
+    part.run(n_like_max=3000, verbose=False)
+    assert len(full.bounds) > 3
+    assert part.n_like == full.n_like
+    assert part.log_z == full.log_z
+    assert np.array_equal(part.posterior()[0], full.posterior()[0])
+    weights = [b.neural_bounds[0].emulator.neural_networks[0].coefs_[-1]
+               for b in full.bounds[1:3]]
+    assert not np.allclose(weights[0], weights[1])
