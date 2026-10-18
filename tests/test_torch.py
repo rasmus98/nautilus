@@ -218,10 +218,10 @@ def test_torch_seed_per_bound_resume(tmp_path):
     assert not np.allclose(weights[0], weights[1])
 
 
-def test_in_later_bounds_matches_loop():
-    # The batched test of all later bounds in sample_shell agrees with testing
-    # each later bound in turn, including periodic phase shifts and a bound
-    # split into several ellipsoids.
+def test_highest_bound_matches_loop():
+    # The batched device test of the bounds in sample_shell and
+    # shell_association agrees with testing each bound in turn, including
+    # periodic phase shifts and points outside the unit cube.
     pytest.importorskip('torch')
     from nautilus import _torch
 
@@ -236,9 +236,15 @@ def test_in_later_bounds_matches_loop():
     assert len(sampler.bounds) > 4
     assert all(b.shift is not None for b in sampler.bounds[1:])
     assert any(len(b.neural_bounds) > 1 for b in sampler.bounds[1:])
-    x = np.random.default_rng(0).random((5000, 3))
+    x = np.random.default_rng(0).random((5000, 3)) * 1.2 - 0.1
     for index in range(len(sampler.bounds)):
         loop = np.zeros(len(x), dtype=bool)
         for bound in sampler.bounds[index + 1:]:
             loop |= bound.contains(x)
-        assert np.array_equal(_torch.in_later_bounds(sampler, index, x), loop)
+        assert np.array_equal(_torch.highest_bound(
+            sampler, x, index + 1, len(sampler.bounds)) >= 0, loop)
+    for n_max in range(len(sampler.bounds) + 1):
+        shell = sampler.shell_association(x, n_max=n_max)
+        sampler.device = None
+        assert np.array_equal(shell, sampler.shell_association(x, n_max=n_max))
+        sampler.device = 'cpu'

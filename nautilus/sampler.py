@@ -821,8 +821,10 @@ class Sampler():
                 # Remove points that are actually in another shell. Each bound
                 # only tests the points not yet found in a later bound.
                 if self.device is not None:
-                    from ._torch import in_later_bounds
-                    points = points[~in_later_bounds(self, index, points)]
+                    from ._torch import highest_bound
+                    points = points[highest_bound(
+                        self, points, index % len(self.bounds) + 1,
+                        len(self.bounds)) < 0]
                 else:
                     for bound in self.bounds[index:][1:]:
                         if len(points) == 0:
@@ -1238,6 +1240,10 @@ class Sampler():
         """
         if n_max is None:
             n_max = len(self.bounds)
+
+        if self.device is not None:
+            from ._torch import highest_bound
+            return highest_bound(self, points, 0, n_max)
 
         shell = np.repeat(-1, len(points))
         for i, bound in reversed(list(enumerate(self.bounds[:n_max]))):
