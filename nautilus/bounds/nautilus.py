@@ -10,6 +10,33 @@ from .periodic import PhaseShift
 from .union import Union, oversample_size
 
 
+def in_any(bounds, points):
+    """Check whether points are contained in any of the bounds.
+
+    Each bound only tests the points not inside a previous bound.
+
+    Parameters
+    ----------
+    bounds : list
+        Bounds with a `contains` method.
+    points : numpy.ndarray
+        A 2-D array where each row represents a point.
+
+    Returns
+    -------
+    in_bound : numpy.ndarray
+        Bool array describing for each point if it is contained in any bound.
+
+    """
+    in_bound = np.zeros(len(points), dtype=bool)
+    for bound in bounds:
+        test = ~in_bound
+        if not np.any(test):
+            break
+        in_bound[test] = bound.contains(points[test])
+    return in_bound
+
+
 class NautilusBound():
     """Union of multiple non-overlapping neural network-based bounds.
 
@@ -165,6 +192,8 @@ class NautilusBound():
             the bound.
 
         """
+        if np.ndim(points) == 1:
+            return self.contains(points[np.newaxis])[0]
         if self.shift is not None:
             points = self.shift.transform(points)
         if self.device is not None:
@@ -172,9 +201,8 @@ class NautilusBound():
             return contains(self, points)
         in_bound = self.outer_bound.contains(points)
         if len(self.neural_bounds) > 0:
-            in_bound = in_bound & np.any(
-                [bound.contains(points) for bound in self.neural_bounds],
-                axis=0)
+            in_bound[in_bound] = in_any(self.neural_bounds,
+                                        points[in_bound])
         return in_bound
 
     @threadpool_limits.wrap(limits=1)
@@ -224,9 +252,7 @@ class NautilusBound():
                     if self.device is None:
                         n_sample = 1000
                         points = self.outer_bound.sample(n_sample)
-                        in_bound = np.any([bound.contains(points) for bound
-                                           in self.neural_bounds], axis=0)
-                        points = points[in_bound]
+                        points = points[in_any(self.neural_bounds, points)]
                     else:
                         from .._torch import sample
                         points, n_sample = sample(self, oversample_size(

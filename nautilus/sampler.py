@@ -818,13 +818,12 @@ class Sampler():
                     self.n_batch - n_sample, pool=self.pool_s)
                 n_bound += self.n_batch - n_sample
 
-                # Remove points that are actually in another shell.
-                in_shell = np.ones(len(points), dtype=bool)
+                # Remove points that are actually in another shell. Each bound
+                # only tests the points not yet found in a later bound.
                 for bound in self.bounds[index:][1:]:
-                    in_shell = in_shell & ~bound.contains(points)
-                    if np.all(~in_shell):
-                        continue
-                points = points[in_shell]
+                    if len(points) == 0:
+                        break
+                    points = points[~bound.contains(points)]
 
                 # Replace points for which we can use transfer points.
                 replace = np.zeros(len(points), dtype=bool)

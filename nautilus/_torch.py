@@ -401,6 +401,18 @@ def _neural_contains(bound, x):
     return in_bound
 
 
+def _in_any_neural(bounds, x):
+    """Whether points lie in any neural bound, testing each bound only on the
+    points not inside a previous one."""
+    in_any = torch.zeros(len(x), dtype=torch.bool, device=x.device)
+    for bound in bounds:
+        idx = torch.nonzero(~in_any)[:, 0]
+        if len(idx) == 0:
+            break
+        in_any[idx] = _neural_contains(bound, x[idx])
+    return in_any
+
+
 def sample(bound, n_points):
     """One pass of `NautilusBound.sample` with the points on the device.
 
@@ -429,9 +441,7 @@ def sample(bound, n_points):
     x = _union_sample(union, oversample_size(
         n_points, union.n_sample, union.n_reject, margin=1, n_min=n_points),
         gen)
-    in_bound = torch.zeros(len(x), dtype=torch.bool, device=x.device)
-    for neural_bound in bound.neural_bounds:
-        in_bound |= _neural_contains(neural_bound, x)
+    in_bound = _in_any_neural(bound.neural_bounds, x)
     return x[in_bound].cpu().numpy(), len(x)
 
 
@@ -460,8 +470,6 @@ def contains(bound, points):
     if union.cube is not None:
         in_bound &= torch.all((x >= 0) & (x < 1), dim=-1)
     if len(bound.neural_bounds) > 0:
-        in_neural = torch.zeros_like(in_bound)
-        for neural_bound in bound.neural_bounds:
-            in_neural |= _neural_contains(neural_bound, x)
-        in_bound &= in_neural
+        idx = torch.nonzero(in_bound)[:, 0]
+        in_bound[idx] = _in_any_neural(bound.neural_bounds, x[idx])
     return in_bound.cpu().numpy().reshape(np.shape(points)[:-1])
