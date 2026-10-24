@@ -544,15 +544,15 @@ def _scores(networks, k_0, k_1, x_t):
     return score
 
 
-def _neural_accept(stack, x, keep):
+def _neural_accept(stack, x):
     """Whether points lie in any of a bound's neural bounds.
 
-    Only points with `keep` are tested. Each network sees the points inside
-    its outer ellipsoid, all networks after one compaction.
+    Each network sees the points inside its outer ellipsoid, all networks
+    after one compaction.
     """
     c, B_inv_T = stack['c_n'], stack['B_inv_T_n']
     todo = torch.stack([torch.sum(((x - c[k]) @ B_inv_T[k])**2, dim=-1) < 1
-                        for k in range(len(c))]) & keep
+                        for k in range(len(c))])
     networks = stack['networks']
     if networks is None:
         return torch.any(todo, dim=0)
@@ -780,12 +780,11 @@ def sample(bound, n_points):
     n_draw = oversample_size(n_points, union.n_sample, union.n_reject,
                              margin=1, n_min=n_points)
     x, keep = _union_draw(union, n_draw, gen)
-    n_keep = torch.sum(keep)
-    if len(bound.neural_bounds) > 0:
-        keep = _neural_accept(_bound_stack(bound), x, keep)
     x = x[keep]
+    n_keep = len(x)
+    if len(bound.neural_bounds) > 0:
+        x = x[_neural_accept(_bound_stack(bound), x)]
     x = x[torch.randperm(len(x), generator=gen, device=x.device)]
-    n_keep = int(n_keep)
     union.n_sample += n_draw
     union.n_reject += n_draw - n_keep
     return x.cpu().numpy(), n_keep
@@ -816,5 +815,6 @@ def contains(bound, points):
     if union.cube is not None:
         in_bound &= torch.all((x >= 0) & (x < 1), dim=-1)
     if len(bound.neural_bounds) > 0:
-        in_bound = _neural_accept(_bound_stack(bound), x, in_bound)
+        idx = torch.nonzero(in_bound)[:, 0]
+        in_bound[idx] = _neural_accept(_bound_stack(bound), x[idx])
     return in_bound.cpu().numpy().reshape(np.shape(points)[:-1])
