@@ -1106,9 +1106,18 @@ class Sampler:
             if self.blobs is not None:
                 self.blobs_t = []
 
+            if self.device is not None:
+                # Test the points of all shells in one device pass.
+                in_bound_all = np.split(self.bounds[-1].contains(
+                    np.concatenate(self.points[:-1])), np.cumsum(
+                        [len(points) for points in self.points[:-2]]))
+
             for shell in range(len(self.bounds) - 1):
 
-                in_bound = self.bounds[-1].contains(self.points[shell])
+                if self.device is not None:
+                    in_bound = in_bound_all[shell]
+                else:
+                    in_bound = self.bounds[-1].contains(self.points[shell])
                 self.shell_t.append(np.repeat(shell, np.sum(in_bound)))
 
                 self.points_t.append(self.points[shell][in_bound])

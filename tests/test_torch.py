@@ -178,8 +178,10 @@ def test_device_union_is_uniform():
         if device is None:
             x = bound.sample(40000)
         else:
-            x = _torch._union_sample(
-                bound, 50000, torch.Generator().manual_seed(0)).numpy()
+            x, keep = _torch._union_draw(
+                bound, 50000, torch.Generator().manual_seed(0))
+            bound.n_sample, bound.n_reject = 50000, 50000 - int(keep.sum())
+            x = x[keep].numpy()
             assert len(x) > 40000
         results.append([np.mean(x, axis=0), np.mean(
             bound.bounds[0].contains(x) & bound.bounds[1].contains(x)),
@@ -218,12 +220,19 @@ def test_torch_seed_per_bound_resume(tmp_path):
     assert not np.allclose(weights[0], weights[1])
 
 
-def test_highest_bound_matches_loop():
+@pytest.mark.parametrize('first_block,chunk', [(1, None), (3, 2**10),
+                                                (1000, None)])
+def test_highest_bound_matches_loop(monkeypatch, first_block, chunk):
     # The batched device test of the bounds in sample_shell and
     # shell_association agrees with testing each bound in turn, including
-    # periodic phase shifts and points outside the unit cube.
+    # periodic phase shifts and points outside the unit cube, for any block
+    # size of the network evaluation and with chunked evaluation.
     pytest.importorskip('torch')
     from nautilus import _torch
+    monkeypatch.setattr(_torch, 'FIRST_BLOCK', first_block)
+    if chunk is not None:
+        monkeypatch.setattr(_torch, 'NETWORK_CHUNK', chunk)
+        monkeypatch.setattr(_torch, 'ELLIPSOID_CHUNK', 64 * chunk)
 
     def likelihood(x):
         return np.logaddexp(-np.sum((x - 0.3)**2, axis=-1) / 0.005,
@@ -248,3 +257,99 @@ def test_highest_bound_matches_loop():
         sampler.device = None
         assert np.array_equal(shell, sampler.shell_association(x, n_max=n_max))
         sampler.device = 'cpu'
+
+
+def test_device_bound_with_cube_dimensions():
+    # A bound whose outer union treats a dimension as unit cube: device
+    # membership is identical to numpy and device draws are uniform in the
+    # bound, with the same volume estimates of the outer union and the bound.
+    pytest.importorskip('torch')
+    from nautilus.bounds import NautilusBound
+    rng = np.random.default_rng(0)
+    points = rng.random((6000, 3))
+    log_l = -np.sum((points[:, :2] - 0.5)**2, axis=1) / 0.02
+    bound = NautilusBound.compute(
+        points, log_l, np.quantile(log_l, 0.7), np.log(0.3), n_points_min=50,
+        rng=np.random.default_rng(1), device='cpu')
+    assert any(np.any(m.dim_cube) for m in bound.outer_bound.bounds)
+
+    x = rng.random((20000, 3))
+    in_device = bound.contains(x)
+    bound.device = None
+    assert np.array_equal(in_device, bound.contains(x))
+
+    results = []
+    for device in [None, 'cpu']:
+        bound.device = device
+        bound.reset(np.random.default_rng(2))
+        x = bound.sample(40000)
+        assert np.all(bound.contains(x))
+        results.append([np.mean(x, axis=0), np.mean(x[:, 2] < 0.25),
+                        bound.outer_bound.log_v, bound.log_v])
+    assert np.allclose(results[0][0], results[1][0], atol=4e-3)
+    assert np.abs(results[0][1] - results[1][1]) < 0.015
+    assert np.abs(results[0][2] - results[1][2]) < 0.02
+    assert np.abs(results[0][3] - results[1][3]) < 0.03
+
+
+def test_device_counters():
+    # One device pass updates the outer union's counters with all drawn
+    # points and returns the number of points kept by the union, of which
+    # the accepted points are a subset in random order.
+    torch = pytest.importorskip('torch')
+    from nautilus import _torch
+    from nautilus.bounds import NautilusBound
+    rng = np.random.default_rng(0)
+    points = rng.random((4000, 3))
+    log_l = np.maximum(-np.sum((points - 0.25)**2, axis=1),
+                       -np.sum((points - 0.75)**2, axis=1)) / 0.02
+    bound = NautilusBound.compute(
+        points, log_l, np.quantile(log_l, 0.9), np.log(0.05),
+        n_points_min=50, split_threshold=1, rng=np.random.default_rng(1),
+        device='cpu')
+    union = bound.outer_bound
+    n_sample, n_reject = union.n_sample, union.n_reject
+    n_draw = _torch.oversample_size(5000, n_sample, n_reject, margin=1,
+                                    n_min=5000)
+    x, n_keep = _torch.sample(bound, 5000)
+    assert union.n_sample - n_sample == n_draw
+    assert union.n_reject - n_reject == n_draw - n_keep
+    assert len(x) <= n_keep <= n_draw
+    assert np.all(bound.contains(x))
+    # Accepted points come in random order, not grouped by union member.
+    first = np.argmax(np.stack([b.contains(x) for b in union.bounds]), axis=0)
+    assert np.mean(first[:len(x) // 2]) == pytest.approx(
+        np.mean(first[len(x) // 2:]), abs=0.1)
+    # The same draws, with the union's keep decision, reproduce n_keep.
+    bound.reset(np.random.default_rng(3))
+    gen = torch.Generator().manual_seed(0)
+    x_all, keep = _torch._union_draw(union, 10000, gen)
+    n_bound = np.sum([b.contains(x_all.numpy()) for b in union.bounds],
+                     axis=0)
+    assert np.all(n_bound >= 1)
+    assert np.all(~keep.numpy() | bound.outer_bound.contains(x_all.numpy()))
+
+
+def test_device_without_networks():
+    # With n_networks=0 the neural bounds are their outer ellipsoids; the
+    # device tests agree with the default backend.
+    pytest.importorskip('torch')
+    from nautilus import _torch
+
+    def likelihood(x):
+        return np.logaddexp(-np.sum((x - 0.3)**2, axis=-1) / 0.005,
+                            -np.sum((x - 0.75)**2, axis=-1) / 0.005)
+
+    sampler = Sampler(lambda x: x, likelihood, n_dim=3, n_live=200,
+                      n_networks=0, vectorized=True, seed=0, backend='torch')
+    sampler.run(n_like_max=3000, verbose=False)
+    assert len(sampler.bounds) > 3
+    x = np.random.default_rng(0).random((5000, 3))
+    for n_max in range(len(sampler.bounds) + 1):
+        shell = sampler.shell_association(x, n_max=n_max)
+        sampler.device = None
+        assert np.array_equal(shell, sampler.shell_association(x, n_max=n_max))
+        sampler.device = 'cpu'
+    bound = sampler.bounds[-1]
+    points, n_keep = _torch.sample(bound, 1000)
+    assert len(points) > 0 and np.all(bound.contains(points))
