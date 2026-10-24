@@ -1,15 +1,15 @@
 """Module implementing basic multi-dimensional bounds."""
 
 import numpy as np
-from scipy.special import gammaln
 from scipy.linalg.lapack import dpotrf, dpotri
+from scipy.special import gammaln
 from threadpoolctl import threadpool_limits
 
 # Recent results of `minimum_volume_enclosing_ellipsoid_batched`.
 _MVEE_CACHE = []
 
 
-class UnitCube():
+class UnitCube:
     r"""Unit (hyper)cube bound.
 
     The :math:`n`-dimensional unit hypercube has :math:`n_{\rm dim}` parameters
@@ -340,7 +340,7 @@ def minimum_volume_enclosing_ellipsoid_batched(points, n_max=100, n_batch=20):
     return tuple(np.copy(x) for x in (c, A, A_inv))
 
 
-class Ellipsoid():
+class Ellipsoid:
     r"""Ellipsoid bound.
 
     Attributes
@@ -556,7 +556,7 @@ class Ellipsoid():
             self.rng = rng
 
 
-class UnitCubeEllipsoidMixture():
+class UnitCubeEllipsoidMixture:
     """Mixture of a unit cube and an ellipsoid.
 
     Dimensions along which an ellipsoid has a smaller volume than a unit cube
@@ -602,7 +602,8 @@ class UnitCubeEllipsoidMixture():
         bound = cls()
         bound.n_dim = points.shape[1]
 
-        kwargs = dict(enlarge_per_dim=enlarge_per_dim, rng=rng, device=device)
+        kwargs = dict(enlarge_per_dim=enlarge_per_dim, rng=rng,  # noqa: C408
+                      device=device)
 
         # First, start by sampling all dimensions using an ellipsoid..
         ellipsoid = Ellipsoid.compute(points, **kwargs)

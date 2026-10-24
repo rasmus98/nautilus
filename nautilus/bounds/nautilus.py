@@ -1,7 +1,8 @@
 """Module implementing the nautilus bound."""
 
-import numpy as np
 from functools import partial
+
+import numpy as np
 from threadpoolctl import threadpool_limits
 
 from .basic import Ellipsoid, UnitCubeEllipsoidMixture
@@ -37,7 +38,7 @@ def in_any(bounds, points):
     return in_bound
 
 
-class NautilusBound():
+class NautilusBound:
     """Union of multiple non-overlapping neural network-based bounds.
 
     The bound is the overlap of the union of multiple neural network-based
@@ -66,7 +67,7 @@ class NautilusBound():
     @classmethod
     def compute(cls, points, log_l, log_l_min, log_v_target,
                 enlarge_per_dim=1.1, n_points_min=None, split_threshold=100,
-                periodic=None, n_networks=4, neural_network_kwargs={},
+                periodic=None, n_networks=4, neural_network_kwargs=None,
                 pool=None, rng=None, device=None):
         """Compute a union of multiple neural network-based bounds.
 
@@ -98,9 +99,9 @@ class NautilusBound():
             Indices of the parameters that are periodic.
         n_networks : int, optional
             Number of networks used in the emulator. Default is 4.
-        neural_network_kwargs : dict, optional
+        neural_network_kwargs : dict or None, optional
             Non-default keyword arguments passed to the constructor of
-            MLPRegressor.
+            MLPRegressor. Default is `None`.
         pool : nautilus.pool.NautilusPool or None, optional
             Pool used for parallel processing. Default is None.
         rng : None or numpy.random.Generator, optional
@@ -137,6 +138,9 @@ class NautilusBound():
 
         while multi_ellipsoid.split(allow_overlap=False):
             pass
+
+        if neural_network_kwargs is None:
+            neural_network_kwargs = {}
 
         for ellipsoid in multi_ellipsoid.bounds:
             select = ellipsoid.contains(points)
@@ -348,7 +352,7 @@ class NautilusBound():
         group.attrs['n_neural_bounds'] = len(self.neural_bounds)
 
         for i, neural_bound in enumerate(self.neural_bounds):
-            neural_bound.write(group.create_group('neural_bound_{}'.format(i)))
+            neural_bound.write(group.create_group(f'neural_bound_{i}'))
 
         self.outer_bound.write(group.create_group('outer_bound'))
 
@@ -411,10 +415,9 @@ class NautilusBound():
 
         bound.neural_bounds = []
         i = 0
-        while 'neural_bound_{}'.format(i) in group:
+        while f'neural_bound_{i}' in group:
             bound.neural_bounds.append(NeuralBound.read(
-                group['neural_bound_{}'.format(i)],
-                rng=bound.rng, device=device))
+                group[f'neural_bound_{i}'], rng=bound.rng, device=device))
             i += 1
 
         bound.outer_bound = Union.read(
