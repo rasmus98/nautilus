@@ -51,9 +51,9 @@ CHECK_EVERY = 4
 # hipcc, alpha != 0, shapes that do not fit, a failed launch or a barrier
 # timeout) use the graph trainer, with one warning per reason.
 TRAIN_KERNEL = False
-# Test membership in `sample` and `highest_bound` with the fused HIP kernels
-# (nautilus/_drawkernel.py) instead of torch operations. Opt-in; AMD GPUs
-# only. The points are drawn by torch as before; decisions equal the torch
+# Test membership in `sample` (and, with `_drawkernel.HIGHEST`, in
+# `highest_bound`) with the fused HIP kernels (nautilus/_drawkernel.py)
+# instead of torch operations. Opt-in; AMD GPUs only. The points are drawn by torch as before; decisions equal the torch
 # path's to rounding, so the samples are identical unless a point lies within
 # rounding of a bound's surface or a network threshold. Cases the kernels do
 # not support use the torch path, with one warning per reason.
@@ -899,6 +899,11 @@ def _draw_kernel_pack(stack, n_dim):
     return packed
 
 
+def _drawkernel_highest():
+    from . import _drawkernel
+    return _drawkernel.HIGHEST
+
+
 def _highest_kernel(sampler, stack, bounds, x_all, first, stop, result):
     """`highest_bound`'s bound tests with the HIP kernel, written to
     `result`; False, with one warning per reason, if it cannot be used."""
@@ -971,7 +976,7 @@ def highest_bound(sampler, points, start, stop):
         n_rows = max(1, ELLIPSOID_CHUNK // (
             (m_1 - m_0 + k_1 - k_0) * sampler.n_dim))
         done = False
-        if DRAW_KERNEL:
+        if DRAW_KERNEL and _drawkernel_highest():
             done = _highest_kernel(sampler, stack, bounds, x_all, first,
                                    stop, result)
         for i in range(len(x_all) if done else 0, len(x_all), n_rows):

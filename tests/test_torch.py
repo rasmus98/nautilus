@@ -696,6 +696,7 @@ def test_draw_kernel_decisions(monkeypatch, nn_dtype):
     from nautilus import _drawkernel, _torch
     monkeypatch.setattr(_torch, 'NN_DTYPE', getattr(torch, nn_dtype))
     monkeypatch.setattr(_drawkernel, '_WARNED', set())
+    monkeypatch.setattr(_drawkernel, 'HIGHEST', True)
     sampler = _two_mode_sampler(n_dim=5, device='cuda')
     assert any(len(b.neural_bounds) > 1 for b in sampler.bounds[1:])
     x = np.random.default_rng(0).random((20000, 5)) * 1.2 - 0.1

@@ -1,7 +1,8 @@
 """Fused HIP membership kernels for the torch backend's draws (opt-in).
 
-`nautilus._torch.sample` and `nautilus._torch.highest_bound` use this module
-only when ``nautilus._torch.DRAW_KERNEL`` is set. `accept` replaces the union
+`nautilus._torch.sample` uses this module only when
+``nautilus._torch.DRAW_KERNEL`` is set, and `nautilus._torch.highest_bound`
+only when `HIGHEST` is set as well. `accept` replaces the union
 multiplicity and keep test, the unit-cube test, the outer-ellipsoid tests and
 the networks of the neural bounds of one draw pass with one kernel launch;
 `highest` replaces the batched bound tests and the block-wise network search
@@ -48,6 +49,14 @@ PAD = 4
 MAX_DIM = 64
 MAX_NEURAL = 64
 MAX_H2, MAX_H3 = 64, 32
+# LDS bytes for one staged chunk of network parameters.
+LDS_BUDGET = 24576
+# Use the `highest` kernel in `highest_bound`. Off: on a 33-dimensional
+# production run (62 shells) its per-point top-down search is slower than
+# the torch path's batched tests (each thread walks the bounds serially, and
+# shell association passes only 256 points), so `DRAW_KERNEL` covers the
+# draws only unless this is set.
+HIGHEST = False
 
 _LIBRARIES = {}
 _WARNED = set()
@@ -253,14 +262,27 @@ def _launch(name, packed, ints, tensors, device):
     h1, h2, h3 = packed['shapes']
     dtype = packed['w'].dtype if 'w' in packed else torch.float32
     lib = library(device, dtype, packed['md'], max(h2, 1), max(h3, 1))
-    ints = (ctypes.c_longlong * 11)(*map(int, ints))
-    pointers = (ctypes.c_void_p * 17)(*map(_pointer, tensors))
+    ints = (ctypes.c_longlong * len(ints))(*map(int, ints))
+    pointers = (ctypes.c_void_p * len(tensors))(*map(_pointer, tensors))
     with torch.cuda.device(device):
         stream = ctypes.c_void_p(torch.cuda.current_stream(
             device).cuda_stream)
         code = getattr(lib, name)(ints, pointers, stream)
     if code != 0:
         raise Unsupported('launch failed: ' + lib.dk_error(code).decode())
+
+
+def lds_plan(md, h1, h2, h3, size):
+    """First-layer units per staged chunk and the LDS bytes of the two
+    `dk_accept` kernels (union: one ellipsoid; networks: an ellipsoid with
+    mean and scale, a chunk of the first two layers, or the rest)."""
+    chunk = max(1, min(max(h1, 1), LDS_BUDGET // ((md + 1 + h2) * size)))
+    union = 8 * (md + md * md)
+    net = max(8 * (md * md + 3 * md), size * chunk * (md + 1 + h2),
+              size * (h2 + h2 * h3 + 2 * h3 + 1))
+    if max(union, net) > 65536:
+        raise Unsupported('LDS {} bytes'.format(max(union, net)))
+    return chunk, union, net
 
 
 def accept(packed, x, u, union_cube):
@@ -290,12 +312,18 @@ def accept(packed, x, u, union_cube):
     h1, h2, h3 = packed['shapes']
     k = len(packed['nc'])
     has_net = 'w' in packed
+    size = packed['w'].element_size() if has_net else 4
+    chunk, lds_union, lds_net = lds_plan(packed['md'], h1, h2, h3, size)
+    count = torch.zeros(1, dtype=torch.int32, device=x.device)
+    rows = torch.empty(n if has_net else 0, dtype=torch.int64, device=x.device)
+    todo = torch.empty_like(rows)
     ints = [n, n_dim, len(packed['mc']), k, h1, packed['n_net'],
-            packed['w'].shape[2] if has_net else 0, union_cube, has_net, 0, 0]
+            packed['w'].shape[2] if has_net else 0, union_cube, has_net, chunk,
+            lds_union, lds_net]
     tensors = [x, u, packed['mc'], packed['mB'], packed['mcube'],
                packed['nc'], packed['nB'], packed.get('mean'),
-               packed.get('scale'), packed.get('w'), packed.get('thr'),
-               None, None, None, keep, acc, None]
+               packed.get('scale'), packed.get('w'), packed.get('thr'), keep,
+               acc, count, rows, todo]
     _launch('dk_accept', packed, ints, tensors, x.device)
     return keep, acc
 

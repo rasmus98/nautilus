@@ -18,8 +18,10 @@
 //
 // dk_accept: one pass of NautilusBound.sample on drawn points x with uniform numbers u: n_bound = number of union
 // members containing the point, keep = u > 1 - 1 / n_bound (and inside the unit cube if the union has one), then
-// accept = keep and inside the outer ellipsoid and the networks of any neural bound. Points that need the networks
-// are compacted per workgroup in LDS first, so that the network loop runs on full wavefronts.
+// accept = keep and inside the outer ellipsoid and the networks of any neural bound. A first kernel does the
+// ellipsoids and appends the points that need networks to a list (device counter, no host wait); a second kernel
+// runs the networks on the list, so the network loop runs on full wavefronts. Ellipsoids and network parameters
+// are staged in LDS per workgroup.
 //
 // dk_highest: for each point the largest bound index in [first, first + J) whose outer union (and unit cube, if the
 // bound has one) contains the point and one of whose neural bounds accepts it, else -1; bounds are tested from the
@@ -167,48 +169,6 @@ __device__ __forceinline__ bool neural(const Args& a, long long p, int k) {
   return score(a, k, xn) > a.thr[k];
 }
 
-__device__ __forceinline__ void accept_body(const Args& a) {
-  __shared__ int list[THREADS];
-  __shared__ uint64_t todo_list[THREADS];
-  __shared__ int count;
-  if (threadIdx.x == 0) count = 0;
-  __syncthreads();
-  const long long p = (long long)blockIdx.x * THREADS + threadIdx.x;
-  uint64_t todo = 0;
-  if (p < a.n) {
-    const uint64_t outside = outside_mask(a, p);
-    int n_bound = 0;
-    for (int m = 0; m < a.M; ++m) n_bound += in_mixture(a, p, outside, m);
-    bool kept = a.u[p] > 1.0 - 1.0 / (double)n_bound;
-    if (a.union_cube && outside != 0) kept = false;
-    a.keep[p] = kept;
-    if (kept)
-      for (int k = 0; k < a.K; ++k)
-        if (in_outer(a, p, k)) todo |= (uint64_t)1 << k;
-    if (!a.has_net || todo == 0) a.accept[p] = a.K == 0 ? kept : todo != 0;
-  }
-  if (a.has_net && todo != 0) {
-    const int slot = atomicAdd(&count, 1);
-    list[slot] = threadIdx.x;
-    todo_list[slot] = todo;
-  }
-  __syncthreads();
-  if (!a.has_net || (int)threadIdx.x >= count) return;
-  // Points that need the networks, compacted: full wavefronts run the network loop.
-  const long long q = (long long)blockIdx.x * THREADS + list[threadIdx.x];
-  const uint64_t mask = todo_list[threadIdx.x];
-  bool acc = false;
-  for (int k = 0; k < a.K; ++k) {
-    if (!acc && ((mask >> k) & 1)) {
-      real xn[MD];
-      in_ellipsoid<true>(a, q, a.nc + (size_t)k * MD, a.nB + (size_t)k * MD * MD, a.nmean + (size_t)k * MD,
-                         a.nscale + (size_t)k * MD, xn);
-      acc = score(a, k, xn) > a.thr[k];
-    }
-  }
-  a.accept[q] = acc;
-}
-
 __device__ __forceinline__ void highest_body(const Args& a) {
   const long long p = (long long)blockIdx.x * THREADS + threadIdx.x;
   const bool live = p < a.n;
@@ -261,11 +221,9 @@ __device__ __forceinline__ Args assemble(DK_PARAMS) {
 
 #define DK_ARGS x, u, mc, mB, mcube, nc, nB, nmean, nscale, w, thr, mstart, nstart, bcube, keep, accept, result, dm
 
-__global__ void __launch_bounds__(THREADS, DK_WAVES) accept_kernel(DK_PARAMS) { accept_body(assemble(DK_ARGS)); }
-
 __global__ void __launch_bounds__(THREADS, DK_WAVES) highest_kernel(DK_PARAMS) { highest_body(assemble(DK_ARGS)); }
 
-int launch(bool highest, const long long* ip, void* const* ptr, void* stream) {
+int launch_highest(const long long* ip, void* const* ptr, void* stream) {
   Dims dm;
   dm.n = ip[0]; dm.d = (int)ip[1]; dm.M = (int)ip[2]; dm.K = (int)ip[3]; dm.H1 = (int)ip[4]; dm.n_net = (int)ip[5];
   dm.NPW = (int)ip[6]; dm.union_cube = (int)ip[7]; dm.has_net = (int)ip[8]; dm.J = (int)ip[9]; dm.first = ip[10];
@@ -289,10 +247,221 @@ int launch(bool highest, const long long* ip, void* const* ptr, void* stream) {
   unsigned char* accept = (unsigned char*)ptr[15];
   long long* result = (long long*)ptr[16];
   const dim3 grid((unsigned)((dm.n + THREADS - 1) / THREADS)), block(THREADS);
-  if (highest)
-    hipLaunchKernelGGL(highest_kernel, grid, block, 0, (hipStream_t)stream, DK_ARGS);
-  else
-    hipLaunchKernelGGL(accept_kernel, grid, block, 0, (hipStream_t)stream, DK_ARGS);
+  hipLaunchKernelGGL(highest_kernel, grid, block, 0, (hipStream_t)stream, DK_ARGS);
+  return (int)hipGetLastError();
+}
+
+// ---- dk_accept: two kernels, parameters staged in LDS ------------------------------------------------------------
+// Every workgroup reads each ellipsoid and each network from LDS (wavefront-wide broadcast reads), staged by all its
+// threads together; scalar loads of the same data straight from memory are latency-bound.
+
+// Stage n values from global memory to LDS (all threads of the workgroup; the caller synchronises).
+template <typename T>
+__device__ __forceinline__ void stage(T* __restrict__ dst, const T* __restrict__ src, int n) {
+  for (int i = threadIdx.x; i < n; i += THREADS) dst[i] = src[i];
+}
+
+// sum_j ((x_p - c) B)_j^2 < 1 with c, B in LDS; with NET also the network input xn (mean, scale in LDS).
+template <bool NET>
+__device__ __forceinline__ bool in_ellipsoid_lds(const double* __restrict__ xp, int d, const double* c,
+                                                 const double* B, const double* mean, const double* scale,
+                                                 real (&xn)[MD]) {
+  double dx[MD];
+#pragma unroll
+  for (int i = 0; i < MD; ++i) dx[i] = (i < d ? xp[i] : 0.0) - c[i];
+  double r = 0.0;
+  if (NET) {
+#pragma unroll
+    for (int j = 0; j < MD; ++j) {
+      double s = 0.0;
+#pragma unroll
+      for (int i = 0; i < MD; ++i) s += dx[i] * B[i * MD + j];
+      xn[j] = (real)((s - mean[j]) / scale[j]);
+      r += s * s;
+      __builtin_amdgcn_sched_barrier(0);  // no LDS reads hoisted across columns: bounded registers
+    }
+  } else {
+#pragma unroll 1
+    for (int j = 0; j < MD; ++j) {
+      double s = 0.0;
+#pragma unroll
+      for (int i = 0; i < MD; ++i) s += dx[i] * B[i * MD + j];
+      r += s * s;
+    }
+  }
+  return r < 1.0;
+}
+
+// Union multiplicity, keep decision and outer-ellipsoid tests; points that need the networks are appended to
+// (list, todo_list) through the device counter `count`. LDS: one ellipsoid (MD + MD * MD doubles).
+__global__ void __launch_bounds__(THREADS, DK_WAVES)
+    accept_union_kernel(const double* __restrict__ x, const double* __restrict__ u, const double* __restrict__ mc,
+                        const double* __restrict__ mB, const uint64_t* __restrict__ mcube,
+                        const double* __restrict__ nc, const double* __restrict__ nB,
+                        unsigned char* __restrict__ keep, unsigned char* __restrict__ accept,
+                        int* __restrict__ count, long long* __restrict__ list, uint64_t* __restrict__ todo_list,
+                        long long n, int d, int M, int K, int union_cube, int has_net) {
+  extern __shared__ double lds[];
+  double* c = lds;
+  double* B = lds + MD;
+  const long long p = (long long)blockIdx.x * THREADS + threadIdx.x;
+  const bool live = p < n;
+  const double* xp = x + (live ? p : 0) * d;
+  uint64_t outside = 0;
+  if (live)
+    for (int i = 0; i < d; ++i)
+      if (xp[i] < 0.0 || xp[i] >= 1.0) outside |= (uint64_t)1 << i;
+  real unused[MD];
+  int n_bound = 0;
+  for (int m = 0; m < M; ++m) {
+    __syncthreads();
+    stage(c, mc + (size_t)m * MD, MD);
+    stage(B, mB + (size_t)m * MD * MD, MD * MD);
+    __syncthreads();
+    if (live && (outside & mcube[m]) == 0) n_bound += in_ellipsoid_lds<false>(xp, d, c, B, c, c, unused);
+  }
+  bool kept = live && u[p] > 1.0 - 1.0 / (double)n_bound;
+  if (union_cube && outside != 0) kept = false;
+  uint64_t todo = 0;
+  for (int k = 0; k < K; ++k) {
+    __syncthreads();
+    stage(c, nc + (size_t)k * MD, MD);
+    stage(B, nB + (size_t)k * MD * MD, MD * MD);
+    __syncthreads();
+    if (kept && in_ellipsoid_lds<false>(xp, d, c, B, c, c, unused)) todo |= (uint64_t)1 << k;
+  }
+  if (!live) return;
+  keep[p] = kept;
+  if (has_net && todo != 0) {
+    const int slot = atomicAdd(count, 1);
+    list[slot] = p;
+    todo_list[slot] = todo;
+  } else {
+    accept[p] = K == 0 ? kept : todo != 0;
+  }
+}
+
+// Networks of the listed points: entry e of the list in workgroup e / THREADS (workgroups past the device count
+// return at once). Per neural bound with work in the workgroup: its outer ellipsoid, mean and scale, then per network
+// the first two layers in chunks of `chunk` first-layer units and the rest, all staged in LDS.
+__global__ void __launch_bounds__(THREADS, DK_WAVES)
+    accept_net_kernel(const double* __restrict__ x, const double* __restrict__ nc, const double* __restrict__ nB,
+                      const double* __restrict__ nmean, const double* __restrict__ nscale,
+                      const real* __restrict__ w, const real* __restrict__ thr, unsigned char* __restrict__ accept,
+                      const int* __restrict__ count, const long long* __restrict__ list,
+                      const uint64_t* __restrict__ todo_list, int d, int K, int H1, int n_net, int NPW, int chunk) {
+  extern __shared__ double lds[];
+  const int n_list = *count;
+  if ((long long)blockIdx.x * THREADS >= n_list) return;
+  const long long e = (long long)blockIdx.x * THREADS + threadIdx.x;
+  const bool live = e < n_list;
+  const long long q = live ? list[e] : 0;
+  const uint64_t mask = live ? todo_list[e] : 0;
+  const double* xp = x + q * d;
+  real* lw = (real*)lds;
+  bool acc = false;
+  for (int k = 0; k < K; ++k) {
+    const bool act = live && !acc && ((mask >> k) & 1);
+    if (!__syncthreads_or(act)) continue;
+    double* c = lds;
+    double* B = c + MD;
+    double* mean = B + MD * MD;
+    double* scale = mean + MD;
+    stage(c, nc + (size_t)k * MD, MD);
+    stage(B, nB + (size_t)k * MD * MD, MD * MD);
+    stage(mean, nmean + (size_t)k * MD, MD);
+    stage(scale, nscale + (size_t)k * MD, MD);
+    __syncthreads();
+    real xn[MD];
+    if (act) in_ellipsoid_lds<true>(xp, d, c, B, mean, scale, xn);
+    real total = 0;
+    for (int net = 0; net < n_net; ++net) {
+      const real* W0 = w + ((size_t)k * n_net + net) * NPW;
+      const real* b0 = W0 + (size_t)H1 * MD;
+      const real* W1 = b0 + H1;
+      const real* tail = W1 + (size_t)H1 * H2;  // b1, W2, b2, W3, b3
+      real h2[H2];
+#pragma unroll
+      for (int o = 0; o < H2; ++o) h2[o] = 0;
+      for (int j0 = 0; j0 < H1; j0 += chunk) {
+        const int nj = min(chunk, H1 - j0);
+        real* sW0 = lw;
+        real* sb0 = sW0 + chunk * MD;
+        real* sW1 = sb0 + chunk;
+        __syncthreads();
+        stage(sW0, W0 + (size_t)j0 * MD, nj * MD);
+        stage(sb0, b0 + j0, nj);
+        stage(sW1, W1 + (size_t)j0 * H2, nj * H2);
+        __syncthreads();
+        if (act) {
+          for (int j = 0; j < nj; ++j) {
+            real s = 0;
+#pragma unroll
+            for (int i = 0; i < MD; ++i) s += xn[i] * sW0[j * MD + i];
+            s += sb0[j];
+            const real r = s > real(0) ? s : real(0);
+#pragma unroll
+            for (int o = 0; o < H2; ++o) h2[o] += r * sW1[j * H2 + o];
+            __builtin_amdgcn_sched_barrier(0);
+          }
+        }
+      }
+      const int n_tail = H2 + H2 * H3 + H3 + H3 + 1;
+      __syncthreads();
+      stage(lw, tail, n_tail);
+      __syncthreads();
+      if (act) {
+        const real* b1 = lw;
+        const real* W2 = b1 + H2;
+        const real* b2 = W2 + H2 * H3;
+        const real* W3 = b2 + H3;
+        const real* b3 = W3 + H3;
+        real h3[H3];
+#pragma unroll
+        for (int t = 0; t < H3; ++t) h3[t] = 0;
+#pragma unroll
+        for (int o = 0; o < H2; ++o) {
+          const real s = h2[o] + b1[o];
+          const real r = s > real(0) ? s : real(0);
+#pragma unroll
+          for (int t = 0; t < H3; ++t) h3[t] += r * W2[o * H3 + t];
+          __builtin_amdgcn_sched_barrier(0);
+        }
+        real out = 0;
+#pragma unroll
+        for (int t = 0; t < H3; ++t) {
+          const real s = h3[t] + b2[t];
+          out += (s > real(0) ? s : real(0)) * W3[t];
+        }
+        total += out + b3[0];
+      }
+    }
+    if (act) acc = total / (real)n_net > thr[k];
+    __syncthreads();
+  }
+  if (live) accept[q] = acc;
+}
+
+// ip: n, d, M, K, H1, n_net, NPW, union_cube, has_net, chunk, lds_union, lds_net. ptr: x, u, mc, mB, mcube, nc, nB,
+// nmean, nscale, w, thr, keep, accept, count (int32, zeroed), list (int64 [n]), todo_list (int64 [n]).
+int launch_accept(const long long* ip, void* const* ptr, void* stream) {
+  const long long n = ip[0];
+  const int d = (int)ip[1], M = (int)ip[2], K = (int)ip[3], H1 = (int)ip[4], n_net = (int)ip[5], NPW = (int)ip[6];
+  const int union_cube = (int)ip[7], has_net = (int)ip[8], chunk = (int)ip[9];
+  const unsigned lds_union = (unsigned)ip[10], lds_net = (unsigned)ip[11];
+  if (d > MD || d > 64 || K > 64 || chunk < 1) return (int)hipErrorInvalidValue;
+  if (n == 0) return 0;
+  const dim3 grid((unsigned)((n + THREADS - 1) / THREADS)), block(THREADS);
+  hipLaunchKernelGGL(accept_union_kernel, grid, block, lds_union, (hipStream_t)stream, (const double*)ptr[0],
+                     (const double*)ptr[1], (const double*)ptr[2], (const double*)ptr[3], (const uint64_t*)ptr[4],
+                     (const double*)ptr[5], (const double*)ptr[6], (unsigned char*)ptr[11], (unsigned char*)ptr[12],
+                     (int*)ptr[13], (long long*)ptr[14], (uint64_t*)ptr[15], n, d, M, K, union_cube, has_net);
+  hipError_t e = hipGetLastError();
+  if (e != hipSuccess || !has_net || K == 0) return (int)e;
+  hipLaunchKernelGGL(accept_net_kernel, grid, block, lds_net, (hipStream_t)stream, (const double*)ptr[0],
+                     (const double*)ptr[5], (const double*)ptr[6], (const double*)ptr[7], (const double*)ptr[8],
+                     (const real*)ptr[9], (const real*)ptr[10], (unsigned char*)ptr[12], (const int*)ptr[13],
+                     (const long long*)ptr[14], (const uint64_t*)ptr[15], d, K, H1, n_net, NPW, chunk);
   return (int)hipGetLastError();
 }
 }  // namespace
@@ -304,10 +473,10 @@ int dk_h2() { return H2; }
 int dk_h3() { return H3; }
 const char* dk_error(int e) { return hipGetErrorString((hipError_t)e); }
 
-// ip: n, d, M, K, H1, n_net, NPW, union_cube, has_net, J, first. ptr: x, u, mc, mB, mcube, nc, nB, nmean, nscale,
-// w, thr, mstart, nstart, bcube, keep, accept, result (unused ones may be null). Launch on `stream` without
-// waiting; returns 0 or a HIP error code.
-int dk_accept(const long long* ip, void* const* ptr, void* stream) { return launch(false, ip, ptr, stream); }
+// dk_accept: see launch_accept. dk_highest: ip n, d, M, K, H1, n_net, NPW, union_cube, has_net, J, first; ptr x, u,
+// mc, mB, mcube, nc, nB, nmean, nscale, w, thr, mstart, nstart, bcube, keep, accept, result (unused ones may be
+// null). Both launch on `stream` without waiting and return 0 or a HIP error code.
+int dk_accept(const long long* ip, void* const* ptr, void* stream) { return launch_accept(ip, ptr, stream); }
 
-int dk_highest(const long long* ip, void* const* ptr, void* stream) { return launch(true, ip, ptr, stream); }
+int dk_highest(const long long* ip, void* const* ptr, void* stream) { return launch_highest(ip, ptr, stream); }
 }
