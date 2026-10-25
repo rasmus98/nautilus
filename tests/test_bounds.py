@@ -452,3 +452,90 @@ def test_minimum_volume_enclosing_ellipsoid_batched(n_points, n_dim):
             bounds.basic.minimum_volume_enclosing_ellipsoid(points),
             bounds.basic.minimum_volume_enclosing_ellipsoid_batched(points)):
         assert np.allclose(a, b, rtol=1e-9, atol=1e-12 * np.amax(np.abs(a)))
+
+
+@pytest.mark.parametrize("n_points,n_dim", [(30, 1), (100, 5), (200, 12)])
+def test_khachiyan_loops_match_numpy(monkeypatch, n_points, n_dim):
+    # The loop version of the batched MVEE iterations (compiled with numba
+    # when available) matches the numpy version up to rounding. Run here
+    # without compilation, so the test does not depend on numba.
+    rng = np.random.default_rng(n_dim)
+    points = rng.normal(size=(n_points, n_dim)) @ rng.normal(
+        size=(n_dim, n_dim)) + rng.random(n_dim)
+    results = []
+    for kernel in [False, bounds.basic._khachiyan]:
+        monkeypatch.setattr(bounds.basic, '_KHACHIYAN', [kernel])
+        bounds.basic._MVEE_CACHE.clear()
+        results.append(bounds.basic.minimum_volume_enclosing_ellipsoid_batched(
+            points, n_max=15))
+    bounds.basic._MVEE_CACHE.clear()
+    for a, b in zip(*results):
+        assert np.allclose(a, b, rtol=1e-9, atol=1e-12 * np.amax(np.abs(a)))
+
+
+@pytest.mark.parametrize("n_dim", [2, 5, 20])
+def test_projected_log_v_matches_loop(n_dim):
+    # The closed form of the projected volumes equals the explicit
+    # projection loop of UnitCubeEllipsoidMixture.compute up to rounding.
+    rng = np.random.default_rng(n_dim)
+    points = rng.normal(size=(300, n_dim)) @ rng.normal(
+        size=(n_dim, n_dim)) + rng.random(n_dim)
+    ellipsoid = bounds.Ellipsoid.compute(points)
+    c = ellipsoid.c
+    A_inv = np.linalg.inv(ellipsoid.A)
+    log_v = np.zeros(n_dim)
+    for i in range(n_dim):
+        points_proj = np.delete(points, i, axis=1)
+        c_proj = np.delete(c, i)
+        A_proj = np.linalg.inv(np.delete(np.delete(A_inv, i, axis=0), i,
+                                         axis=1))
+        A_proj /= np.amax(np.einsum('...i,ij,...j', points_proj - c_proj,
+                                    A_proj, points_proj - c_proj))
+        log_v[i] = np.linalg.slogdet(np.linalg.inv(A_proj))[1]
+    assert np.allclose(bounds.basic.projected_log_v(points, c, ellipsoid.A),
+                       log_v, rtol=0, atol=1e-10)
+
+
+def test_mixture_device_matches_numpy():
+    # The device path of UnitCubeEllipsoidMixture.compute selects the same
+    # cube dimensions and gives the same ellipsoid up to rounding.
+    rng = np.random.default_rng(0)
+    points = rng.random((2000, 6))
+    points[:, :3] = 0.5 + 0.05 * rng.normal(size=(2000, 3)) @ rng.normal(
+        size=(3, 3))
+    mixtures = [bounds.UnitCubeEllipsoidMixture.compute(points, device=device)
+                for device in [None, 'cpu']]
+    bounds.basic._MVEE_CACHE.clear()
+    assert np.any(mixtures[0].dim_cube) and not np.all(mixtures[0].dim_cube)
+    assert np.array_equal(mixtures[0].dim_cube, mixtures[1].dim_cube)
+    assert np.allclose(mixtures[0].ellipsoid.A, mixtures[1].ellipsoid.A,
+                       rtol=1e-7)
+
+
+def test_contains_with_box_prefilter():
+    # The prefiltered membership test is identical to Ellipsoid.contains,
+    # including for points just inside and outside the boundary.
+    from nautilus.bounds.nautilus import contains_with_box_prefilter
+    rng = np.random.default_rng(0)
+    points = rng.normal(size=(500, 4)) @ rng.normal(size=(4, 4))
+    ellipsoid = bounds.Ellipsoid.compute(points)
+    x = rng.normal(size=(20000, 4))
+    x /= np.sqrt(np.sum(x**2, axis=1))[:, np.newaxis]
+    x *= (1 + rng.choice([-1, 1], size=20000) * 10.0**rng.uniform(
+        -15, 0, size=20000))[:, np.newaxis]
+    x = ellipsoid.transform(x, inverse=True)
+    x = np.concatenate([x, rng.normal(size=(20000, 4)) * 5])
+    in_bound = ellipsoid.contains(x)
+    assert 0 < np.mean(in_bound) < 1
+    assert np.array_equal(contains_with_box_prefilter(ellipsoid, x), in_bound)
+
+
+@pytest.mark.parametrize("device", [None, 'cpu'])
+def test_single_thread(device):
+    # BLAS pools are limited to one thread inside the context and restored
+    # afterwards.
+    from threadpoolctl import threadpool_info
+    before = [p['num_threads'] for p in threadpool_info()]
+    with bounds.basic.single_thread(device):
+        assert all(p['num_threads'] == 1 for p in threadpool_info())
+    assert [p['num_threads'] for p in threadpool_info()] == before

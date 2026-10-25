@@ -12,9 +12,9 @@ except ImportError:
     pass
 import numpy as np
 from scipy.special import logsumexp
-from threadpoolctl import threadpool_limits
 
 from .bounds import NautilusBound, UnitCube
+from .bounds.basic import single_thread
 from .pool import NautilusPool, likelihood_worker
 
 
@@ -823,7 +823,7 @@ class Sampler:
         idx_t = np.zeros(0, dtype=int)
         points_all = []
 
-        with threadpool_limits(limits=1):
+        with single_thread(self.device):
             while n_sample < self.n_batch:
                 points = self.bounds[index].sample(
                     self.n_batch - n_sample, pool=self.pool_s)
@@ -1047,8 +1047,16 @@ class Sampler:
             if verbose:
                 self.print_status('Bounding', end='\r')
             log_l = np.concatenate(self.log_l)
-            points = np.concatenate(self.points)[np.argsort(log_l)]
-            log_l = np.sort(log_l)
+            if self.device is not None:
+                # Same arrays as below with one sort instead of two; the
+                # unsorted concatenation is reused for the transfer test.
+                points_all = np.concatenate(self.points)
+                order = np.argsort(log_l)
+                points = points_all[order]
+                log_l = log_l[order]
+            else:
+                points = np.concatenate(self.points)[np.argsort(log_l)]
+                log_l = np.sort(log_l)
             log_l_min = log_l[-self.n_live]
 
             # If log_l_min is part of a likelihood plateau and there exist
@@ -1061,7 +1069,7 @@ class Sampler:
             if np.all(log_l >= log_l_min):
                 success = False
             else:
-                with threadpool_limits(limits=1):
+                with single_thread(self.device):
                     bound = NautilusBound.compute(
                         points, log_l, log_l_min, self.log_v_live,
                         enlarge_per_dim=self.enlarge_per_dim,
@@ -1107,15 +1115,26 @@ class Sampler:
                 self.blobs_t = []
 
             if self.device is not None:
-                # Test the points of all shells in one device pass.
+                # Test the points of all shells in one device pass. The
+                # points of the previous shells are the concatenation formed
+                # above (the newest shell is still empty).
                 in_bound_all = np.split(self.bounds[-1].contains(
-                    np.concatenate(self.points[:-1])), np.cumsum(
+                    points_all), np.cumsum(
                         [len(points) for points in self.points[:-2]]))
 
             for shell in range(len(self.bounds) - 1):
 
                 if self.device is not None:
                     in_bound = in_bound_all[shell]
+                    if not np.any(in_bound):
+                        # Nothing to transfer: skip the copies of the shell.
+                        self.shell_t.append(np.zeros(0, dtype=int))
+                        self.points_t.append(self.points[shell][:0])
+                        self.log_l_t.append(self.log_l[shell][:0])
+                        if self.blobs is not None:
+                            self.blobs_t.append(self.blobs[shell][:0])
+                        self.update_shell_info(shell)
+                        continue
                 else:
                     in_bound = self.bounds[-1].contains(self.points[shell])
                 self.shell_t.append(np.repeat(shell, np.sum(in_bound)))

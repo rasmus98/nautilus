@@ -3,10 +3,39 @@
 import numpy as np
 from scipy.linalg.lapack import dpotrf, dpotri
 from scipy.special import gammaln
-from threadpoolctl import threadpool_limits
+from threadpoolctl import ThreadpoolController, threadpool_limits
 
 # Recent results of `minimum_volume_enclosing_ellipsoid_batched`.
 _MVEE_CACHE = []
+# `_khachiyan` compiled with numba (None: not tried yet; False: numba is
+# missing) and the thread pool controller of the torch backend.
+_KHACHIYAN = [None]
+_CONTROLLER = []
+
+
+def single_thread(device=None):
+    """Context limiting BLAS and OpenMP pools to one thread.
+
+    For the torch backend (`device` not None), one `ThreadpoolController` is
+    reused: creating one per call, as `threadpool_limits` does, scans all
+    loaded libraries, which takes about a millisecond.
+
+    Parameters
+    ----------
+    device : str or None, optional
+        Torch device, or None for the default backend. Default is None.
+
+    Returns
+    -------
+    context : threadpoolctl context manager
+        The limit.
+
+    """
+    if device is None:
+        return threadpool_limits(limits=1)
+    if not _CONTROLLER:
+        _CONTROLLER.append(ThreadpoolController())
+    return _CONTROLLER[0].limit(limits=1)
 
 
 class UnitCube:
@@ -252,7 +281,9 @@ def minimum_volume_enclosing_ellipsoid_batched(points, n_max=100, n_batch=20):
     iteration evaluates all points with one matrix product instead of
     materialising their outer products. The `n_batch` sequential rank-one
     updates of an iteration are resolved on the small Gram matrix of the
-    selected points (Sherman-Morrison) and then applied at once.
+    selected points (Sherman-Morrison) and then applied at once. If numba is
+    installed, the iterations run compiled (`_khachiyan`), which gives the
+    same result up to floating-point rounding.
 
     Parameters
     ----------
@@ -290,42 +321,48 @@ def minimum_volume_enclosing_ellipsoid_batched(points, n_max=100, n_batch=20):
     u = np.repeat(1.0 / n_points, n_points)
     v = (q.T * u) @ q
 
-    for i in range(n_max):
-        q_v_inv = q @ invert_symmetric_positive_semidefinite_matrix(v)
-        g = np.einsum('ij,ij->i', q_v_inv, q)
-        idx = np.argpartition(g, -n_batch)[-n_batch:]
-        idx = idx[np.argsort(g[idx])[::-1]]
-        q_b = q[idx]
-        gram = q_v_inv[idx] @ q_b.T
+    kernel = _khachiyan_kernel()
+    if kernel is not None:
+        u = kernel(q, u, v, n_max, n_batch)
+    else:
+        for i in range(n_max):
+            q_v_inv = q @ invert_symmetric_positive_semidefinite_matrix(v)
+            g = np.einsum('ij,ij->i', q_v_inv, q)
+            idx = np.argpartition(g, -n_batch)[-n_batch:]
+            idx = idx[np.argsort(g[idx])[::-1]]
+            q_b = q[idx]
+            gram = q_v_inv[idx] @ q_b.T
 
-        # Sequential updates. Column k of the Gram matrix after the first k
-        # updates is s_k * h_k, h_k = gram_k - sum_{m<k} gamma_m h_m h_m[k].
-        a = np.zeros(n_batch)
-        h = np.zeros((n_batch, n_batch))
-        gamma = np.zeros(n_batch)
-        s = 1.0
-        for k in range(n_batch):
-            h_k = h[:, k]
-            if k > 0:
-                np.subtract(gram[:, k], h[:, :k] @ (gamma[:k] * h[k, :k]),
-                            out=h_k)
-            else:
-                h_k[:] = gram[:, 0]
-            g_k = s * float(h_k[k])
-            if g_k < n_1:
-                h_k[:] = 0
-                continue
-            a_k = (g_k - n_1) / (n_1 * (g_k - 1))
-            a[k] = a_k
-            gamma[k] = a_k / (1 - a_k + a_k * g_k) * s
-            s /= 1 - a_k
+            # Sequential updates. Column k of the Gram matrix after the first
+            # k updates is s_k * h_k,
+            # h_k = gram_k - sum_{m<k} gamma_m h_m h_m[k].
+            a = np.zeros(n_batch)
+            h = np.zeros((n_batch, n_batch))
+            gamma = np.zeros(n_batch)
+            s = 1.0
+            for k in range(n_batch):
+                h_k = h[:, k]
+                if k > 0:
+                    np.subtract(gram[:, k],
+                                h[:, :k] @ (gamma[:k] * h[k, :k]), out=h_k)
+                else:
+                    h_k[:] = gram[:, 0]
+                g_k = s * float(h_k[k])
+                if g_k < n_1:
+                    h_k[:] = 0
+                    continue
+                a_k = (g_k - n_1) / (n_1 * (g_k - 1))
+                a[k] = a_k
+                gamma[k] = a_k / (1 - a_k + a_k * g_k) * s
+                s /= 1 - a_k
 
-        # v <- prod_k (1 - a_k) v + sum_k a_k prod_{l>k} (1 - a_l) q_k q_k^T
-        keep = np.cumprod((1 - a)[::-1])[::-1]
-        w = a * np.append(keep[1:], 1.0)
-        v = keep[0] * v + (q_b.T * w) @ q_b
-        u *= keep[0]
-        u[idx] += w
+            # v <- prod_k (1 - a_k) v
+            #      + sum_k a_k prod_{l>k} (1 - a_l) q_k q_k^T
+            keep = np.cumprod((1 - a)[::-1])[::-1]
+            w = a * np.append(keep[1:], 1.0)
+            v = keep[0] * v + (q_b.T * w) @ q_b
+            u *= keep[0]
+            u[idx] += w
 
     c = np.atleast_1d(np.average(points, weights=u, axis=0))
     A_inv = np.atleast_2d(np.cov(points, aweights=u, rowvar=False, bias=True))
@@ -338,6 +375,153 @@ def minimum_volume_enclosing_ellipsoid_batched(points, n_max=100, n_batch=20):
     _MVEE_CACHE.insert(0, (key, np.copy(points), (c, A, A_inv)))
     del _MVEE_CACHE[4:]
     return tuple(np.copy(x) for x in (c, A, A_inv))
+
+
+def _khachiyan_kernel():
+    """`_khachiyan` compiled with numba, or None if numba is missing."""
+    if _KHACHIYAN[0] is None:
+        try:
+            import numba
+            _KHACHIYAN[0] = numba.njit(cache=True)(_khachiyan)
+        except ImportError:
+            _KHACHIYAN[0] = False
+    return _KHACHIYAN[0] or None
+
+
+def _khachiyan(q, u, v, n_max, n_batch):
+    """Iterations of `minimum_volume_enclosing_ellipsoid_batched`, written
+    with loops for numba.
+
+    Each iteration inverts `v`, evaluates all points with one matrix product,
+    takes the `n_batch` points with the largest values in decreasing order
+    and applies their sequential rank-one updates through the Gram matrix of
+    these points, as the numpy loop does.
+
+    Parameters
+    ----------
+    q : numpy.ndarray of shape (n_points, n_dim + 1)
+        Points with a column of ones appended.
+    u : numpy.ndarray of shape (n_points, )
+        Initial point weights.
+    v : numpy.ndarray of shape (n_dim + 1, n_dim + 1)
+        Initial weighted second moment of `q`.
+    n_max : int
+        Number of iterations.
+    n_batch : int
+        Number of points updated per iteration (at most `n_points`).
+
+    Returns
+    -------
+    u : numpy.ndarray
+        Final point weights.
+
+    """
+    n_points, n_1 = q.shape
+    u = u.copy()
+    v = v.copy()
+    g = np.zeros(n_points)
+    idx = np.zeros(n_batch, dtype=np.int64)
+    gram = np.zeros((n_batch, n_batch))
+    h = np.zeros((n_batch, n_batch))
+    a = np.zeros(n_batch)
+    gamma = np.zeros(n_batch)
+    keep = np.zeros(n_batch + 1)
+    for _ in range(n_max):
+        q_v_inv = q @ np.linalg.inv(v)
+        for i in range(n_points):
+            g_i = 0.0
+            for j in range(n_1):
+                g_i += q_v_inv[i, j] * q[i, j]
+            g[i] = g_i
+        # Indices of the n_batch largest values in decreasing order.
+        n_sel = 0
+        for i in range(n_points):
+            if n_sel == n_batch and g[i] <= g[idx[n_sel - 1]]:
+                continue
+            k = n_sel if n_sel < n_batch else n_batch - 1
+            while k > 0 and g[idx[k - 1]] < g[i]:
+                idx[k] = idx[k - 1]
+                k -= 1
+            idx[k] = i
+            n_sel = min(n_sel + 1, n_batch)
+        for k in range(n_batch):
+            for m in range(n_batch):
+                x = 0.0
+                for j in range(n_1):
+                    x += q_v_inv[idx[k], j] * q[idx[m], j]
+                gram[k, m] = x
+
+        # Sequential updates: column k of the Gram matrix after the first k
+        # updates is s_k * h_k, h_k = gram_k - sum_{m<k} gamma_m h_m h_m[k].
+        s = 1.0
+        for k in range(n_batch):
+            for r in range(n_batch):
+                x = gram[r, k]
+                for m in range(k):
+                    x -= h[r, m] * (gamma[m] * h[k, m])
+                h[r, k] = x
+            g_k = s * h[k, k]
+            if g_k < n_1:
+                a[k] = 0.0
+                gamma[k] = 0.0
+                for r in range(n_batch):
+                    h[r, k] = 0.0
+                continue
+            a[k] = (g_k - n_1) / (n_1 * (g_k - 1))
+            gamma[k] = a[k] / (1 - a[k] + a[k] * g_k) * s
+            s /= 1 - a[k]
+
+        # v <- prod_k (1 - a_k) v + sum_k a_k prod_{l>k} (1 - a_l) q_k q_k^T
+        keep[n_batch] = 1.0
+        for k in range(n_batch - 1, -1, -1):
+            keep[k] = keep[k + 1] * (1 - a[k])
+        for i in range(n_1):
+            for j in range(n_1):
+                x = keep[0] * v[i, j]
+                for k in range(n_batch):
+                    x += a[k] * keep[k + 1] * q[idx[k], i] * q[idx[k], j]
+                v[i, j] = x
+        for i in range(n_points):
+            u[i] *= keep[0]
+        for k in range(n_batch):
+            u[idx[k]] += a[k] * keep[k + 1]
+    return u
+
+
+def projected_log_v(points, c, A):
+    """Log-volumes (up to a constant) of an ellipsoid projected along each axis.
+
+    Entry i is the log-volume of the ellipsoid obtained by dropping dimension
+    i of the ellipsoid (c, A), i.e., inverting `A^-1` without row and column
+    i, and rescaling it to just enclose `points` without dimension i. This is
+    the closed form of the per-dimension loop in
+    `UnitCubeEllipsoidMixture.compute` and equal to it up to floating-point
+    rounding: the projected matrix is the Schur complement S_i of `A[i, i]`
+    in `A`, so the projected quadratic form of x - c is
+    `q - (A (x - c))_i^2 / A[i, i]` and `log det S_i = log det A - log A[i, i]`.
+
+    Parameters
+    ----------
+    points : numpy.ndarray with shape (n_points, n_dim)
+        Points the projected ellipsoids must enclose.
+    c : numpy.ndarray with shape (n_dim, )
+        Center of the ellipsoid.
+    A : numpy.ndarray with shape (n_dim, n_dim)
+        Matrix of the ellipsoid, :math:`(x - c)^T A (x - c) \\leq 1`.
+
+    Returns
+    -------
+    log_v : numpy.ndarray with shape (n_dim, )
+        Log-determinant of the inverse matrix of each projected ellipsoid,
+        i.e., its log-volume up to a constant common to all entries.
+
+    """
+    d = points - c
+    y = d @ A
+    diag = np.diag(A)
+    quad = np.sum(y * d, axis=1)[:, np.newaxis] - y**2 / diag
+    return (np.log(diag) - np.linalg.slogdet(A)[1] +
+            (len(c) - 1) * np.log(np.amax(quad, axis=0)))
 
 
 class Ellipsoid:
@@ -402,7 +586,7 @@ class Ellipsoid:
             raise ValueError('Number of points must be larger than number ' +
                              'dimensions.')
 
-        with threadpool_limits(limits=1):
+        with single_thread(device):
             if device is None:
                 bound.c, bound.A, A_inv = minimum_volume_enclosing_ellipsoid(
                     points)
@@ -612,21 +796,28 @@ class UnitCubeEllipsoidMixture:
         # Sample dimensions from the unit cube until volume doesn't decrease.
         while np.sum(~bound.dim_cube) > 1:
             c = ellipsoid.c
-            A_inv = np.linalg.inv(ellipsoid.A)
 
             # Start by projecting the current ellipsoid along each dimension to
             # estimate dropping which dimension is most likely to lead to the
             # biggest volume reduction.
-            log_v = np.zeros(np.sum(~bound.dim_cube))
-            for i in range(np.sum(~bound.dim_cube)):
-                points_proj = np.delete(points[:, ~bound.dim_cube], i, axis=1)
-                c_proj = np.delete(c, i)
-                A_inv_proj = np.delete(np.delete(A_inv, i, axis=0), i, axis=1)
-                A_proj = np.linalg.inv(A_inv_proj)
-                scale = np.amax(np.einsum('...i,ij,...j', points_proj - c_proj,
-                                A_proj, points_proj - c_proj))
-                A_proj /= scale
-                log_v[i] = np.linalg.slogdet(np.linalg.inv(A_proj))[1]
+            if device is not None:
+                log_v = projected_log_v(
+                    points[:, ~bound.dim_cube], c, ellipsoid.A)
+            else:
+                A_inv = np.linalg.inv(ellipsoid.A)
+                log_v = np.zeros(np.sum(~bound.dim_cube))
+                for i in range(np.sum(~bound.dim_cube)):
+                    points_proj = np.delete(points[:, ~bound.dim_cube], i,
+                                            axis=1)
+                    c_proj = np.delete(c, i)
+                    A_inv_proj = np.delete(np.delete(A_inv, i, axis=0), i,
+                                           axis=1)
+                    A_proj = np.linalg.inv(A_inv_proj)
+                    scale = np.amax(np.einsum(
+                        '...i,ij,...j', points_proj - c_proj, A_proj,
+                        points_proj - c_proj))
+                    A_proj /= scale
+                    log_v[i] = np.linalg.slogdet(np.linalg.inv(A_proj))[1]
 
             dim = np.arange(bound.n_dim)[~bound.dim_cube][np.argmin(log_v)]
             bound.dim_cube[dim] = True

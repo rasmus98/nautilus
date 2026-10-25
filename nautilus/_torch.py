@@ -333,6 +333,135 @@ def capture(functions):
     return replay
 
 
+def _gaussian_parameters(x, resp, reg_covar):
+    """`_estimate_gaussian_parameters` of scikit-learn (full covariances).
+
+    `resp` has one row per run and component. Every row goes through the same
+    operations as its own batch element, so two runs whose components are a
+    permutation of each other give identical numbers, as in scikit-learn.
+
+    Returns the component sums `nk`, the means, the covariances, the Cholesky
+    factors of the precisions and whether a covariance is not positive
+    definite.
+    """
+    x_b = x.expand(len(resp), -1, -1)
+    nk = torch.sum(resp, dim=1) + 10 * torch.finfo(resp.dtype).eps
+    means = torch.bmm(resp[:, None, :], x_b)[:, 0] / nk[:, None]
+    diff = x_b - means[:, None, :]
+    covariances = torch.bmm((diff * resp[..., None]).mT, diff) / nk[
+        :, None, None]
+    covariances.diagonal(dim1=-2, dim2=-1).add_(reg_covar)
+    cov_chol, info = torch.linalg.cholesky_ex(covariances)
+    eye = torch.eye(x.shape[1], dtype=x.dtype, device=x.device)
+    precisions_chol = torch.linalg.solve_triangular(
+        cov_chol, eye.expand_as(cov_chol), upper=False).mT
+    return nk, means, covariances, precisions_chol, info > 0
+
+
+def gaussian_mixture(points, random_state, device, n_components=2, n_init=10,
+                     tol=1e-3, reg_covar=1e-6, max_iter=100):
+    """`GaussianMixture(n_components, n_init=n_init,
+    random_state=random_state).fit(points)`, with the EM runs on a device.
+
+    The algorithm is scikit-learn's: full covariances, one k-means
+    initialisation per run (scikit-learn's `KMeans`, drawing from one random
+    state in the same order), EM steps until the change of the mean
+    log-likelihood is below `tol` or for `max_iter` steps, and the run with
+    the highest final lower bound wins, the first one on ties. Only the EM
+    steps of the `n_init` runs are batched, so the result equals
+    scikit-learn's up to floating-point rounding. Runs that converge to the
+    same solution with permuted components tie exactly in scikit-learn; they
+    tie here too (see `_gaussian_parameters`), and lower bounds within a
+    relative 1e-12 count as ties in case rounding breaks one.
+
+    Returns
+    -------
+    weights, means, covariances : numpy.ndarray
+        Parameters of the best run, as `weights_`, `means_` and
+        `covariances_` of `GaussianMixture`.
+
+    Raises
+    ------
+    ValueError
+        If a covariance is not positive definite, as in scikit-learn.
+
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.utils import check_array, check_random_state
+
+    points = check_array(points, dtype=[np.float64, np.float32],
+                         ensure_min_samples=2)
+    n_points, n_dim = points.shape
+    k = n_components
+    random_state = check_random_state(random_state)
+    resp = np.zeros((n_init, k, n_points))
+    for i in range(n_init):
+        labels = KMeans(n_clusters=k, n_init=1,
+                        random_state=random_state).fit(points).labels_
+        resp[i, labels, np.arange(n_points)] = 1
+
+    device = torch.device(device)
+    x = torch.as_tensor(points, dtype=torch.float64, device=device)
+    # Parameters per run and component, flattened: row i * k + j.
+    nk, means, covariances, precisions_chol, failed = _gaussian_parameters(
+        x, torch.as_tensor(resp.reshape(n_init * k, n_points), device=device),
+        reg_covar)
+    weights = nk.view(n_init, k) / n_points
+    const = n_dim * np.log(2 * np.pi)
+    lower_bound = np.full(n_init, -np.inf)
+    active = np.arange(n_init)
+    failed = bool(torch.any(failed))
+    for _ in range(max_iter):
+        if failed:
+            break
+        runs = torch.as_tensor(active, device=device)
+        rows = torch.as_tensor((active[:, None] * k + np.arange(k)).ravel(),
+                               device=device)
+        p_chol = precisions_chol[rows]
+        # E-step: log of the weighted probability of each point under each
+        # component, normalised over the components.
+        y = torch.bmm(x.expand(len(rows), -1, -1), p_chol) - torch.bmm(
+            means[rows][:, None, :], p_chol)
+        log_det = torch.sum(torch.log(torch.diagonal(
+            p_chol, dim1=-2, dim2=-1)), dim=-1)
+        log_prob = (-0.5 * (const + torch.sum(y**2, dim=-1)) +
+                    log_det[:, None]) + torch.log(weights[runs]).view(-1, 1)
+        log_prob = log_prob.view(len(active), k, n_points)
+        log_prob_norm = torch.logsumexp(log_prob, dim=1)
+        # M-step.
+        nk_a, means[rows], covariances[rows], precisions_chol[rows], \
+            failed_a = _gaussian_parameters(x, torch.exp(
+                log_prob - log_prob_norm[:, None]).view(-1, n_points),
+                reg_covar)
+        nk_a = nk_a.view(len(active), k)
+        weights[runs] = nk_a / torch.sum(nk_a, dim=1, keepdim=True)
+        # One copy to the host per step: the lower bounds and failures.
+        lower_bound_new = torch.cat([torch.mean(log_prob_norm, dim=1),
+                                     failed_a.to(torch.float64)]).cpu().numpy()
+        failed = np.any(lower_bound_new[len(active):] > 0)
+        lower_bound_new = lower_bound_new[:len(active)]
+        change = lower_bound_new - lower_bound[active]
+        lower_bound[active] = lower_bound_new
+        active = active[~(np.abs(change) < tol)]
+        if len(active) == 0:
+            break
+    if failed:
+        raise ValueError(
+            "Fitting the mixture model failed because some components have "
+            "ill-defined empirical covariance (for instance caused by "
+            "singleton or collapsed samples). Try to decrease the number of "
+            "components, increase reg_covar, or scale the input data.")
+
+    best, max_lower_bound = 0, -np.inf
+    for i in range(n_init):
+        if (max_lower_bound == -np.inf or lower_bound[i] - max_lower_bound >
+                1e-12 * abs(max_lower_bound)):
+            best, max_lower_bound = i, lower_bound[i]
+    return tuple(a.cpu().numpy() for a in (
+        weights[best], means[best * k:(best + 1) * k],
+        covariances[best * k:(best + 1) * k]))
+
+
 def predict(emulator, x):
     """Average prediction of an emulator's networks on a torch device.
 

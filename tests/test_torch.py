@@ -510,3 +510,63 @@ def test_train_kernel_timeout(monkeypatch):
         nets = _torch.train_networks(x, y, 4, kwargs, 'cuda', 3)
     _same_networks(nets, graph, rtol=1e-12, atol=1e-15)
     assert _megakernel._FAILED == ['barrier timeout']
+
+
+@pytest.mark.parametrize('case', ['separated', 'overlapping', 'elongated'])
+def test_gaussian_mixture_matches_sklearn(case):
+    # The device Gaussian mixture used to split ellipsoids gives the fit of
+    # scikit-learn's GaussianMixture (same k-means initialisations, EM steps
+    # and choice of the best run, including ties between runs that converge
+    # to the same solution with swapped components) up to rounding.
+    pytest.importorskip('torch')
+    from scipy.stats import multivariate_normal
+    from sklearn.mixture import GaussianMixture
+    from nautilus._torch import gaussian_mixture
+    rng = np.random.default_rng(0)
+    if case == 'separated':
+        points = np.concatenate([rng.normal(size=(300, 4)),
+                                 rng.normal(size=(200, 4)) + 6])
+    elif case == 'overlapping':
+        points = np.concatenate([rng.normal(size=(250, 3)),
+                                 rng.normal(size=(250, 3)) + 1.5])
+    else:
+        points = rng.normal(size=(500, 8)) * np.geomspace(1, 0.01, 8)
+    for seed in range(3):
+        gmm = GaussianMixture(n_components=2, n_init=10,
+                              random_state=seed).fit(points)
+        weights, means, covariances = gaussian_mixture(points, seed, 'cpu')
+        assert np.allclose(weights, gmm.weights_, rtol=1e-9, atol=0)
+        assert np.allclose(means, gmm.means_, rtol=1e-9, atol=1e-12)
+        assert np.allclose(covariances, gmm.covariances_, rtol=1e-9,
+                           atol=1e-12)
+        labels = [np.argmax(np.array([multivariate_normal.logpdf(
+            points, mean=m, cov=c) for m, c in zip(mu, cov)]), axis=0)
+            for mu, cov in [(gmm.means_, gmm.covariances_),
+                            (means, covariances)]]
+        assert np.array_equal(labels[0], labels[1])
+
+
+def test_union_split_device_matches_numpy():
+    # Splitting an ellipsoid union on the device path (batched Gaussian
+    # mixture, batched MVEE) gives the same ellipsoids as the numpy path and
+    # leaves the random generator in the same state.
+    pytest.importorskip('torch')
+    from nautilus import bounds
+    rng = np.random.default_rng(0)
+    points = np.concatenate([rng.normal(size=(400, 3)) * 0.05 + 0.3,
+                             rng.normal(size=(400, 3)) * 0.05 + 0.7])
+    unions = []
+    rngs = []
+    for device in [None, 'cpu']:
+        rngs.append(np.random.default_rng(1))
+        union = bounds.Union.compute(points, n_points_min=50,
+                                     rng=rngs[-1], device=device)
+        while union.split(allow_overlap=False):
+            pass
+        unions.append(union)
+    bounds.basic._MVEE_CACHE.clear()
+    assert len(unions[0].bounds) == len(unions[1].bounds) > 1
+    for a, b in zip(unions[0].bounds, unions[1].bounds):
+        assert np.allclose(a.c, b.c, rtol=1e-9)
+        assert np.allclose(a.A, b.A, rtol=1e-7)
+    assert rngs[0].bit_generator.state == rngs[1].bit_generator.state

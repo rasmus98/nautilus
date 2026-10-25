@@ -227,12 +227,19 @@ class Union:
         index = np.argmax(np.where(~self.block, self.log_v_all, -np.inf))
         points = self.bounds[index].transform(self.points_bounds[index])
 
-        gmm = GaussianMixture(
-            n_components=2, n_init=10,
-            random_state=self.rng.integers(2**32 - 1)).fit(points)
+        if self.device is None:
+            gmm = GaussianMixture(
+                n_components=2, n_init=10,
+                random_state=self.rng.integers(2**32 - 1)).fit(points)
+            weights, means, covariances = (
+                gmm.weights_, gmm.means_, gmm.covariances_)
+        else:
+            from .._torch import gaussian_mixture
+            weights, means, covariances = gaussian_mixture(
+                points, self.rng.integers(2**32 - 1), self.device)
         p = np.vstack([multivariate_normal.logpdf(
-            points, mean=gmm.means_[i], cov=gmm.covariances_[i]) +
-            np.log(gmm.weights_[i]) for i in range(2)]).T
+            points, mean=means[i], cov=covariances[i]) +
+            np.log(weights[i]) for i in range(2)]).T
 
         labels = np.argmax(p, axis=1)
         # If one of the clusters has less than n_points_min members, re-assign

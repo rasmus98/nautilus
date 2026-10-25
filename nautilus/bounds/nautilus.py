@@ -38,6 +38,37 @@ def in_any(bounds, points):
     return in_bound
 
 
+def contains_with_box_prefilter(ellipsoid, points):
+    """Same result as `ellipsoid.contains(points)`, transforming fewer points.
+
+    The ellipsoid is the image of the unit ball under x = B t + c, so it lies
+    in the box |x_j - c_j| <= ||B_j||, with B_j the j-th row of B. Points
+    outside the box (widened by a relative 1e-9 against rounding) are outside
+    the ellipsoid; the others are tested exactly as in `contains`. The
+    transform of a point does not depend on the other points passed, so the
+    result is identical.
+
+    Parameters
+    ----------
+    ellipsoid : nautilus.bounds.basic.Ellipsoid
+        Ellipsoid to test against.
+    points : numpy.ndarray with shape (n_points, n_dim)
+        Points to test.
+
+    Returns
+    -------
+    in_bound : numpy.ndarray
+        Whether each point is contained in the ellipsoid.
+
+    """
+    half_width = np.sqrt(np.sum(ellipsoid.B**2, axis=1)) * (1 + 1e-9)
+    candidates = np.flatnonzero(np.all(
+        np.abs(points - ellipsoid.c) <= half_width, axis=1))
+    in_bound = np.zeros(len(points), dtype=bool)
+    in_bound[candidates] = ellipsoid.contains(points[candidates])
+    return in_bound
+
+
 class NautilusBound:
     """Union of multiple non-overlapping neural network-based bounds.
 
@@ -143,7 +174,10 @@ class NautilusBound:
             neural_network_kwargs = {}
 
         for ellipsoid in multi_ellipsoid.bounds:
-            select = ellipsoid.contains(points)
+            if device is None:
+                select = ellipsoid.contains(points)
+            else:
+                select = contains_with_box_prefilter(ellipsoid, points)
             bound.neural_bounds.append(NeuralBound.compute(
                 points[select], log_l[select], log_l_min,
                 enlarge_per_dim=enlarge_per_dim, n_networks=n_networks,
