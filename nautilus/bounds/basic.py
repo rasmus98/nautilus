@@ -1,5 +1,7 @@
 """Module implementing basic multi-dimensional bounds."""
 
+import warnings
+
 import numpy as np
 from scipy.linalg.lapack import dpotrf, dpotri
 from scipy.special import gammaln
@@ -384,6 +386,9 @@ def _khachiyan_kernel():
             import numba
             _KHACHIYAN[0] = numba.njit(cache=True)(_khachiyan)
         except ImportError:
+            warnings.warn("numba is not installed: the batched MVEE runs its "
+                          "iterations in numpy, with the same result but "
+                          "slower.")
             _KHACHIYAN[0] = False
     return _KHACHIYAN[0] or None
 
