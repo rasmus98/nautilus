@@ -490,3 +490,23 @@ def test_train_kernel_matches_graphs(monkeypatch, dtype):
         for a, b in zip(*nets):
             assert np.allclose(a.loss_curve_[:3], b.loss_curve_[:3],
                                rtol=1e-3)
+
+
+def test_train_kernel_timeout(monkeypatch):
+    # A barrier timeout (forced by a 100 ns limit) ends the kernel; it is
+    # then disabled for the process and the call returns the graph trainer's
+    # networks.
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip('needs an AMD GPU')
+    from nautilus import _megakernel, _torch
+    monkeypatch.setattr(_megakernel, 'TIMEOUT', 1e-7)
+    monkeypatch.setattr(_megakernel, '_FAILED', [])
+    monkeypatch.setattr(_megakernel, '_WARNED', set())
+    x, y, kwargs = _kernel_case(3000, 33)
+    graph = _torch.train_networks(x, y, 4, kwargs, 'cuda', 3)
+    monkeypatch.setattr(_torch, 'TRAIN_KERNEL', True)
+    with pytest.warns(RuntimeWarning, match='barrier timeout'):
+        nets = _torch.train_networks(x, y, 4, kwargs, 'cuda', 3)
+    _same_networks(nets, graph, rtol=1e-12, atol=1e-15)
+    assert _megakernel._FAILED == ['barrier timeout']
