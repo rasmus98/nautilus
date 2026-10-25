@@ -45,6 +45,12 @@ GRAPH_STEPS = 16
 # CUDA devices, where each check waits for the device. Stopped networks are
 # frozen, so the extra epochs do not change the result.
 CHECK_EVERY = 4
+# Train with the split-minibatch HIP kernel (nautilus/_megakernel.py) instead
+# of the CUDA graphs. Opt-in; AMD GPUs only. The result equals the graph
+# trainer's to rounding. Cases the kernel does not support (other devices, no
+# hipcc, alpha != 0, shapes that do not fit, a failed launch or a barrier
+# timeout) use the graph trainer, with one warning per reason.
+TRAIN_KERNEL = False
 
 
 def train_networks(x, y, n_networks, neural_network_kwargs, device, seed=0):
@@ -96,7 +102,45 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device, seed=0):
     else:
         batch_size = int(np.clip(network.batch_size, 1, n_points))
 
-    # Weights and biases of all networks, stacked along the first axis.
+    x = torch.as_tensor(x, dtype=NN_DTYPE, device=device)
+    y = torch.as_tensor(y, dtype=NN_DTYPE, device=device)
+    result = None
+    if TRAIN_KERNEL:
+        result = _train_kernel(x, y, units, n_networks, network, seed,
+                               batch_size)
+    if result is None:
+        gen, params = _init(units, n_networks, device, seed)
+        result = (params, ) + _train_graphs(x, y, params, network, gen,
+                                            batch_size)
+    params, loss_curve, active_curve, best_loss = result
+
+    active_curve = active_curve.cpu().numpy()
+    loss_curve = loss_curve.cpu().numpy()
+    best_loss = best_loss.cpu().numpy()
+    n_iter = np.sum(active_curve, axis=0)
+    weights = [p.detach().to('cpu', torch.float64).numpy() for p in params]
+    networks = []
+    for i in range(n_networks):
+        network = MLPRegressor(**neural_network_kwargs)
+        network.coefs_ = [w[i] for w in weights[::2]]
+        network.intercepts_ = [b[i, 0] for b in weights[1::2]]
+        network.n_features_in_ = n_dim
+        network.n_outputs_ = 1
+        network.n_layers_ = len(units)
+        network.out_activation_ = 'identity'
+        network.n_iter_ = n_iter[i]
+        network.t_ = n_iter[i] * n_points
+        network.loss_curve_ = loss_curve[active_curve[:, i], i].tolist()
+        network.loss_ = network.loss_curve_[-1]
+        network.best_loss_ = best_loss[i]
+        networks.append(network)
+
+    return networks
+
+
+def _init(units, n_networks, device, seed):
+    """Generator and initial weights and biases of all networks, stacked
+    along the first axis (Glorot uniform, drawn in float64)."""
     gen = torch.Generator(device=device).manual_seed(seed)
     params = []
     for fan_in, fan_out in zip(units[:-1], units[1:]):
@@ -106,6 +150,48 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device, seed=0):
                 (n_networks, ) + shape, dtype=torch.float64,
                 device=device).uniform_(-bound, bound, generator=gen).to(
                 NN_DTYPE).requires_grad_(True))
+    return gen, params
+
+
+def _step_sizes(network, n_steps, device, epoch_0, n_epochs):
+    """Bias-corrected Adam step sizes of epochs epoch_0, ...,
+    epoch_0 + n_epochs - 1, shape (n_epochs, n_steps)."""
+    t = np.arange(epoch_0 * n_steps + 1, (epoch_0 + n_epochs) * n_steps + 1)
+    return torch.as_tensor(
+        network.learning_rate_init * np.sqrt(1 - network.beta_2**t) /
+        (1 - network.beta_1**t), dtype=NN_DTYPE, device=device).view(
+            n_epochs, n_steps)
+
+
+def _train_kernel(x, y, units, n_networks, network, seed, batch_size):
+    """Train with the HIP kernel (TRAIN_KERNEL). Returns the parameters and
+    curves as `_train_graphs`, or None if the kernel does not support the
+    case."""
+    from . import _megakernel
+    try:
+        if network.alpha != 0:
+            raise _megakernel.Unsupported('alpha != 0')
+        if n_networks < 1:
+            raise _megakernel.Unsupported('no networks')
+        _megakernel.library(x.device, NN_DTYPE)
+        gen, params = _init(units, n_networks, x.device, seed)
+        curves = _megakernel.train(
+            x, y, params, network, gen, batch_size, CHECK_EVERY, partial(
+                _step_sizes, network, -(-len(x) // batch_size), x.device))
+    except _megakernel.Unsupported as error:
+        _megakernel.warn_once(str(error))
+        return None
+    return (params, ) + curves
+
+
+def _train_graphs(x, y, params, network, gen, batch_size):
+    """Train the stacked parameters in place with Adam, replaying each epoch
+    as CUDA graphs on CUDA devices; see `train_networks`.
+
+    Returns the loss curve, the active curve and the best loss.
+    """
+    device = x.device
+    n_networks, (n_points, n_dim) = len(params[0]), x.shape
 
     def forward(h):
         for k in range(0, len(params), 2):
@@ -114,12 +200,9 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device, seed=0):
                 h = torch.relu(h)
         return h[..., 0]
 
-    x = torch.as_tensor(x, dtype=NN_DTYPE, device=device)
-    y = torch.as_tensor(y, dtype=NN_DTYPE, device=device)
     m = [torch.zeros_like(p) for p in params]
     v = [torch.zeros_like(p) for p in params]
-    lr, beta_1, beta_2 = (network.learning_rate_init, network.beta_1,
-                          network.beta_2)
+    beta_1, beta_2 = network.beta_1, network.beta_2
     alpha, eps = network.alpha, network.epsilon
     slices = [(start, min(start + batch_size, n_points)) for start in
               range(0, n_points, batch_size)]
@@ -186,11 +269,8 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device, seed=0):
     check_every = CHECK_EVERY if device.type == 'cuda' else 1
     for epoch_0 in range(0, network.max_iter, check_every):
         n_epochs = min(check_every, network.max_iter - epoch_0)
-        t = np.arange(epoch_0 * len(slices) + 1,
-                      (epoch_0 + n_epochs) * len(slices) + 1)
-        lr_block = torch.as_tensor(
-            lr * np.sqrt(1 - beta_2**t) / (1 - beta_1**t), dtype=NN_DTYPE,
-            device=device).view(n_epochs, len(slices))
+        lr_block = _step_sizes(network, len(slices), device, epoch_0,
+                               n_epochs)
         for i in range(epoch_0, epoch_0 + n_epochs):
             perm = torch.argsort(torch.rand(
                 (n_networks, n_points), generator=gen, device=device), dim=1)
@@ -209,29 +289,7 @@ def train_networks(x, y, n_networks, neural_network_kwargs, device, seed=0):
             loss_curve[i].copy_(loss_epoch)
         if not torch.any(active):
             break
-
-    active_curve = active_curve.cpu().numpy()
-    loss_curve = loss_curve.cpu().numpy()
-    best_loss = best_loss.cpu().numpy()
-    n_iter = np.sum(active_curve, axis=0)
-    weights = [p.detach().to('cpu', torch.float64).numpy() for p in params]
-    networks = []
-    for i in range(n_networks):
-        network = MLPRegressor(**neural_network_kwargs)
-        network.coefs_ = [w[i] for w in weights[::2]]
-        network.intercepts_ = [b[i, 0] for b in weights[1::2]]
-        network.n_features_in_ = n_dim
-        network.n_outputs_ = 1
-        network.n_layers_ = len(units)
-        network.out_activation_ = 'identity'
-        network.n_iter_ = n_iter[i]
-        network.t_ = n_iter[i] * n_points
-        network.loss_curve_ = loss_curve[active_curve[:, i], i].tolist()
-        network.loss_ = network.loss_curve_[-1]
-        network.best_loss_ = best_loss[i]
-        networks.append(network)
-
-    return networks
+    return loss_curve, active_curve, best_loss
 
 
 def capture(functions):

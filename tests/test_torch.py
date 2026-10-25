@@ -353,3 +353,140 @@ def test_device_without_networks():
     bound = sampler.bounds[-1]
     points, n_keep = _torch.sample(bound, 1000)
     assert len(points) > 0 and np.all(bound.contains(points))
+
+
+def _kernel_case(n_points=600, n_dim=5):
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(n_points, n_dim))
+    y = np.argsort(np.argsort(np.sum(x**2, axis=1))) / float(n_points)
+    kwargs = dict(hidden_layer_sizes=(12, 7), alpha=0, max_iter=30,
+                  learning_rate_init=1e-2, batch_size=50, tol=3e-4,
+                  n_iter_no_change=1)
+    return x, y, kwargs
+
+
+def _same_networks(nets_a, nets_b, rtol=0, atol=0):
+    for a, b in zip(nets_a, nets_b):
+        assert a.n_iter_ == b.n_iter_
+        assert np.allclose(a.loss_curve_, b.loss_curve_, rtol=rtol, atol=atol)
+        for w_a, w_b in zip(a.coefs_ + a.intercepts_,
+                            b.coefs_ + b.intercepts_):
+            assert np.allclose(w_a, w_b, rtol=rtol, atol=atol)
+
+
+def test_train_kernel_switch_and_fallback(monkeypatch):
+    # TRAIN_KERNEL is off by default. When on, cases the HIP kernel does not
+    # support (here: a CPU device, alpha > 0, a kernel failure) give exactly
+    # the graph trainer's networks, with one warning per reason.
+    torch = pytest.importorskip('torch')
+    import warnings
+    from nautilus import _megakernel, _torch
+    assert _torch.TRAIN_KERNEL is False
+    monkeypatch.setattr(_megakernel, '_WARNED', set())
+    x, y, kwargs = _kernel_case()
+    graph = _torch.train_networks(x, y, 3, kwargs, 'cpu', 5)
+    assert len(set(net.n_iter_ for net in graph)) > 1
+
+    monkeypatch.setattr(_torch, 'TRAIN_KERNEL', True)
+    with pytest.warns(RuntimeWarning, match='AMD GPU'):
+        _same_networks(_torch.train_networks(x, y, 3, kwargs, 'cpu', 5),
+                       graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')  # the same reason warns only once
+        _torch.train_networks(x, y, 3, kwargs, 'cpu', 5)
+    with pytest.warns(RuntimeWarning, match='alpha'):
+        _torch.train_networks(x, y, 3, kwargs | dict(alpha=1e-4), 'cpu', 5)
+
+    # A kernel that fails after starting (launch error, barrier timeout):
+    # fresh initialization, same result as the graph trainer.
+    def fail(x, y, params, *args):
+        with torch.no_grad():
+            params[0].add_(1.0)
+        raise _megakernel.Unsupported('barrier timeout')
+
+    monkeypatch.setattr(_megakernel, 'library', lambda *args: None)
+    monkeypatch.setattr(_megakernel, 'train', fail)
+    with pytest.warns(RuntimeWarning, match='barrier timeout'):
+        _same_networks(_torch.train_networks(x, y, 3, kwargs, 'cpu', 5),
+                       graph)
+
+
+def test_train_kernel_cache_and_layout(tmp_path):
+    # The compiled kernel is cached per source, architecture and dtype; the
+    # work split respects the LDS and co-residency limits.
+    torch = pytest.importorskip('torch')
+    from nautilus import _megakernel
+    path = _megakernel.cache_path(b'src', 'gfx90a:sramecc+:xnack-',
+                                  torch.float64, tmp_path)
+    assert path.parent == tmp_path and path.name.endswith('-f64.so')
+    assert 'gfx90a_sramecc_xnack' in path.name
+    assert path == _megakernel.cache_path(
+        b'src', 'gfx90a:sramecc+:xnack-', torch.float64, tmp_path)
+    assert len({path, _megakernel.cache_path(
+        b'src2', 'gfx90a:sramecc+:xnack-', torch.float64, tmp_path),
+        _megakernel.cache_path(b'src', 'gfx942', torch.float64, tmp_path),
+        _megakernel.cache_path(b'src', 'gfx90a:sramecc+:xnack-',
+                               torch.float32, tmp_path)}) == 4
+
+    calls = []
+
+    def max_blocks(ldsw, threads, lds):
+        calls.append(lds)
+        return 110
+
+    units = [33, 100, 50, 20, 1]
+    plan = _megakernel.layout(units, 200, 4, torch.float64, max_blocks)
+    assert plan['NP'] == 9491 and not plan['ldsw']
+    assert (plan['G'], plan['R'], plan['RC'], plan['nch']) == (16, 13, 16, 1)
+    assert plan['act'] == [0, 16 * 33, 16 * 133, 16 * 183, 16 * 203]
+    assert plan['lds'] == 8 * (16 * 206 + 4) <= _megakernel.LDS_BYTES
+    assert plan['ow'][1] == 3400 and plan['ob'][3] == 9490
+    plan = _megakernel.layout(units, 200, 4, torch.float32, max_blocks)
+    assert plan['ldsw'] and (plan['G'], plan['R'], plan['RC']) == (27, 8, 8)
+    assert plan['lds'] == 4 * (9491 + 8 * 206 + 4)
+    # Eight networks: fewer workgroups each, so that all are co-resident.
+    assert _megakernel.layout(units, 200, 8, torch.float32,
+                              max_blocks)['G'] == 13
+    # Small batches: at least 4 rows per workgroup.
+    assert _megakernel.layout(units, 30, 4, torch.float64,
+                              max_blocks)['G'] == 8
+    # Wide inputs: weights in global memory, rows in several chunks.
+    plan = _megakernel.layout([1500, 100, 1], 200, 4, torch.float64,
+                              max_blocks)
+    assert not plan['ldsw'] and plan['RC'] == 4 and plan['nch'] == 4
+    assert plan['S'] == plan['G'] * plan['nch']
+    with pytest.raises(_megakernel.Unsupported):
+        _megakernel.layout([10000, 100, 1], 200, 4, torch.float64, max_blocks)
+    with pytest.raises(_megakernel.Unsupported):
+        _megakernel.layout(units, 200, 111, torch.float64, max_blocks)
+    with pytest.raises(_megakernel.Unsupported):
+        _megakernel.layout([5] + [8] * 9 + [1], 200, 4, torch.float64,
+                           max_blocks)
+
+
+@pytest.mark.parametrize('dtype', ['float64', 'float32'])
+def test_train_kernel_matches_graphs(monkeypatch, dtype):
+    # On an AMD GPU, the HIP kernel gives the graph trainer's networks: in
+    # float64 the same epochs and weights to rounding, including early
+    # stopping; in float32 (rounding-chaotic training) the same loss curve
+    # over the first epochs.
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip('needs an AMD GPU')
+    import warnings
+    from nautilus import _torch
+    monkeypatch.setattr(_torch, 'NN_DTYPE', getattr(torch, dtype))
+    x, y, kwargs = _kernel_case(3000, 33)
+    nets = []
+    for kernel in [False, True]:
+        monkeypatch.setattr(_torch, 'TRAIN_KERNEL', kernel)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')  # no fallback
+            nets.append(_torch.train_networks(x, y, 4, kwargs, 'cuda', 3))
+    if dtype == 'float64':
+        assert len(set(net.n_iter_ for net in nets[0])) > 1
+        _same_networks(*nets, rtol=1e-10, atol=1e-13)
+    else:
+        for a, b in zip(*nets):
+            assert np.allclose(a.loss_curve_[:3], b.loss_curve_[:3],
+                               rtol=1e-3)
