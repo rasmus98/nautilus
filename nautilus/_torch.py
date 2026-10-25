@@ -51,6 +51,13 @@ CHECK_EVERY = 4
 # hipcc, alpha != 0, shapes that do not fit, a failed launch or a barrier
 # timeout) use the graph trainer, with one warning per reason.
 TRAIN_KERNEL = False
+# Test membership in `sample` and `highest_bound` with the fused HIP kernels
+# (nautilus/_drawkernel.py) instead of torch operations. Opt-in; AMD GPUs
+# only. The points are drawn by torch as before; decisions equal the torch
+# path's to rounding, so the samples are identical unless a point lies within
+# rounding of a bound's surface or a network threshold. Cases the kernels do
+# not support use the torch path, with one warning per reason.
+DRAW_KERNEL = False
 
 
 def train_networks(x, y, n_networks, neural_network_kwargs, device, seed=0):
@@ -595,17 +602,25 @@ def _union_draw(union, n_points, gen):
         Whether each point is kept.
 
     """
+    x, u = _union_points(union, n_points, gen)
+    n_bound = sum(_contains(bound, x).to(torch.float64) for bound in
+                  union.bounds)
+    keep = u > 1 - 1.0 / n_bound
+    if union.cube is not None:
+        keep &= torch.all((x >= 0) & (x < 1), dim=-1)
+    return x, keep
+
+
+def _union_points(union, n_points, gen):
+    """The random numbers of `_union_draw`: the points, grouped by bound, and
+    one uniform number per point for the keep decision."""
     p = np.exp(np.array(union.log_v_all) - logsumexp(union.log_v_all))
     n_per_bound = union.rng.multinomial(n_points, p)
     x = torch.cat([_sample(bound, int(n), gen) for bound, n in
                    zip(union.bounds, n_per_bound)])
-    n_bound = sum(_contains(bound, x).to(torch.float64) for bound in
-                  union.bounds)
-    keep = torch.rand(n_points, generator=gen, dtype=torch.float64,
-                      device=x.device) > 1 - 1.0 / n_bound
-    if union.cube is not None:
-        keep &= torch.all((x >= 0) & (x < 1), dim=-1)
-    return x, keep
+    u = torch.rand(n_points, generator=gen, dtype=torch.float64,
+                   device=x.device)
+    return x, u
 
 
 def _stack_networks(bounds, device):
@@ -868,6 +883,48 @@ def _highest(networks, k_0, x_t, todo, level):
     return result[:n_points]
 
 
+def _draw_kernel_pack(stack, n_dim):
+    """Kernel tensors of a bound stack (`_bound_stack` or `_stack_bounds`),
+    or None, with one warning per reason, if the kernels cannot be used."""
+    from . import _drawkernel
+    try:
+        packed = _drawkernel.pack(stack, n_dim, NN_DTYPE)
+        h1, h2, h3 = packed['shapes']
+        dtype = packed['w'].dtype if 'w' in packed else torch.float32
+        _drawkernel.library(stack['c_m'].device, dtype, packed['md'],
+                            max(h2, 1), max(h3, 1))
+    except _drawkernel.Unsupported as error:
+        _drawkernel.warn_once(str(error))
+        return None
+    return packed
+
+
+def _highest_kernel(sampler, stack, bounds, x_all, first, stop, result):
+    """`highest_bound`'s bound tests with the HIP kernel, written to
+    `result`; False, with one warning per reason, if it cannot be used."""
+    from . import _drawkernel
+    if any(bound.shift is not None for bound in bounds):
+        _drawkernel.warn_once('periodic phase shifts')
+        return False
+    packed = _draw_kernel_pack(stack, sampler.n_dim)
+    if packed is None:
+        return False
+    if 'starts' not in packed:
+        device = x_all.device
+        packed['starts'] = [torch.as_tensor(stack[name], dtype=torch.int64,
+                                            device=device) for name in
+                            ('start_m', 'start_n')]
+    start_m, start_n = packed['starts']
+    try:
+        result.copy_(_drawkernel.highest(
+            packed, x_all, start_m[first - 1:stop], start_n[first - 1:stop],
+            stack['cube'][first - 1:stop - 1], first))
+    except _drawkernel.Unsupported as error:
+        _drawkernel.warn_once(str(error))
+        return False
+    return True
+
+
 def highest_bound(sampler, points, start, stop):
     """Index of the last of the sampler's bounds `start` to `stop - 1`
     containing each point, on the device.
@@ -913,7 +970,11 @@ def highest_bound(sampler, points, start, stop):
         cube = stack['cube'][first - 1:stop - 1]
         n_rows = max(1, ELLIPSOID_CHUNK // (
             (m_1 - m_0 + k_1 - k_0) * sampler.n_dim))
-        for i in range(0, len(x_all), n_rows):
+        done = False
+        if DRAW_KERNEL:
+            done = _highest_kernel(sampler, stack, bounds, x_all, first,
+                                   stop, result)
+        for i in range(len(x_all) if done else 0, len(x_all), n_rows):
             x = x_all[i:i + n_rows]
             if all(bound.shift is None for bound in bounds):
                 x = x.expand(len(bounds), -1, -1)
@@ -966,11 +1027,31 @@ def sample(bound, n_points):
     union = bound.outer_bound
     n_draw = oversample_size(n_points, union.n_sample, union.n_reject,
                              margin=1, n_min=n_points)
-    x, keep = _union_draw(union, n_draw, gen)
-    x = x[keep]
-    n_keep = len(x)
-    if len(bound.neural_bounds) > 0:
-        x = x[_neural_accept(_bound_stack(bound), x)]
+    packed = _draw_kernel_pack(_bound_stack(bound), bound.n_dim) if \
+        DRAW_KERNEL else None
+    if packed is not None:
+        from . import _drawkernel
+        x, u = _union_points(union, n_draw, gen)
+        try:
+            keep, accept = _drawkernel.accept(packed, x, u,
+                                              union.cube is not None)
+        except _drawkernel.Unsupported as error:
+            _drawkernel.warn_once(str(error))
+            keep = u > 1 - 1.0 / sum(_contains(b, x).to(torch.float64) for b
+                                     in union.bounds)
+            if union.cube is not None:
+                keep &= torch.all((x >= 0) & (x < 1), dim=-1)
+            accept = keep.clone()
+            if len(bound.neural_bounds) > 0:
+                accept[keep] = _neural_accept(_bound_stack(bound), x[keep])
+        x = x[accept]
+        n_keep = int(keep.sum())
+    else:
+        x, keep = _union_draw(union, n_draw, gen)
+        x = x[keep]
+        n_keep = len(x)
+        if len(bound.neural_bounds) > 0:
+            x = x[_neural_accept(_bound_stack(bound), x)]
     x = x[torch.randperm(len(x), generator=gen, device=x.device)]
     union.n_sample += n_draw
     union.n_reject += n_draw - n_keep
