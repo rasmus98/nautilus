@@ -3,7 +3,7 @@
 // padded dimension DK_MD, second and third hidden widths DK_H2, DK_H3) and loads it with ctypes. All pointers are
 // torch device tensors.
 //
-// One thread per point; the point (padded with zeros to DK_MD dimensions) lives in registers. Ellipsoids are stored
+// One thread per point; the point (padded with zeros to DK_MD dimensions) is re-read for each test. Ellipsoids are stored
 // as their centre c (DK_MD) and B_inv^T (DK_MD x DK_MD, zero-padded), so the transformed point is
 // y_j = sum_i (x_i - c_i) B[i][j] and the point is inside if sum_j y_j^2 < 1, all in float64. A cube-ellipsoid
 // mixture also needs its cube dimensions inside [0, 1) (bit mask over dimensions); a mixture without an ellipsoid
@@ -39,6 +39,9 @@
 #ifndef DK_H3
 #define DK_H3 20
 #endif
+#ifndef DK_WAVES
+#define DK_WAVES 1  // minimum waves per SIMD the register allocation must allow (1: no spills, 2 resident)
+#endif
 
 namespace {
 typedef DK_REAL real;
@@ -66,51 +69,50 @@ struct Args {
   int d, M, K, H1, n_net, NPW, union_cube, has_net, J;
 };
 
-__device__ __forceinline__ void load_point(const Args& a, long long p, double (&x)[MD], uint64_t& outside) {
-  outside = 0;
-#pragma unroll
-  for (int i = 0; i < MD; ++i) {
-    x[i] = i < a.d ? a.x[p * a.d + i] : 0.0;
-    if (i < a.d && (x[i] < 0.0 || x[i] >= 1.0)) outside |= (uint64_t)1 << i;
+// Bit i set if coordinate i of point p lies outside [0, 1).
+__device__ __forceinline__ uint64_t outside_mask(const Args& a, long long p) {
+  uint64_t outside = 0;
+  for (int i = 0; i < a.d; ++i) {
+    const double v = a.x[p * a.d + i];
+    if (v < 0.0 || v >= 1.0) outside |= (uint64_t)1 << i;
   }
+  return outside;
 }
 
-// sum_j ((x - c) B)_j^2 < 1; the transformed point is written to y if Y.
-template <bool Y>
-__device__ __forceinline__ bool in_ellipsoid(const double (&x)[MD], const double* __restrict__ c,
-                                             const double* __restrict__ B, double (&y)[MD]) {
+// sum_j ((x_p - c) B)_j^2 < 1. With NET, also the network input ((y - mean) / scale) rounded to real, in xn. The
+// point is re-read from memory for every test (cached), which keeps one array of MD doubles in registers.
+template <bool NET>
+__device__ __forceinline__ bool in_ellipsoid(const Args& a, long long p, const double* __restrict__ c,
+                                             const double* __restrict__ B, const double* __restrict__ mean,
+                                             const double* __restrict__ scale, real (&xn)[MD]) {
   double dx[MD];
 #pragma unroll
-  for (int i = 0; i < MD; ++i) dx[i] = x[i] - c[i];
+  for (int i = 0; i < MD; ++i) dx[i] = (i < a.d ? a.x[p * a.d + i] : 0.0) - c[i];
   double r = 0.0;
 #pragma unroll
   for (int j = 0; j < MD; ++j) {
     double s = 0.0;
 #pragma unroll
     for (int i = 0; i < MD; ++i) s += dx[i] * B[i * MD + j];
-    if (Y) y[j] = s;
+    if (NET) xn[j] = (real)((s - mean[j]) / scale[j]);
     r += s * s;
   }
   return r < 1.0;
 }
 
-__device__ __forceinline__ bool in_union(const Args& a, const double (&x)[MD], uint64_t outside, int m0, int m1) {
-  double unused[MD];
-  bool in = false;
-  for (int m = m0; m < m1; ++m) {
-    if (!in && (outside & a.mcube[m]) == 0)
-      in = in_ellipsoid<false>(x, a.mc + (size_t)m * MD, a.mB + (size_t)m * MD * MD, unused);
-  }
-  return in;
+__device__ __forceinline__ bool in_mixture(const Args& a, long long p, uint64_t outside, int m) {
+  real unused[MD];
+  return (outside & a.mcube[m]) == 0 &&
+         in_ellipsoid<false>(a, p, a.mc + (size_t)m * MD, a.mB + (size_t)m * MD * MD, nullptr, nullptr, unused);
 }
 
-// Mean network output of neural bound k for the transformed point y.
-__device__ __forceinline__ real score(const Args& a, int k, const double (&y)[MD]) {
-  real xn[MD];
-  const double* mean = a.nmean + (size_t)k * MD;
-  const double* scale = a.nscale + (size_t)k * MD;
-#pragma unroll
-  for (int i = 0; i < MD; ++i) xn[i] = (real)((y[i] - mean[i]) / scale[i]);
+__device__ __forceinline__ bool in_outer(const Args& a, long long p, int k) {
+  real unused[MD];
+  return in_ellipsoid<false>(a, p, a.nc + (size_t)k * MD, a.nB + (size_t)k * MD * MD, nullptr, nullptr, unused);
+}
+
+// Mean network output of neural bound k for the network input xn.
+__device__ __forceinline__ real score(const Args& a, int k, const real (&xn)[MD]) {
   const int H1 = a.H1;
   real total = 0;
   for (int net = 0; net < a.n_net; ++net) {
@@ -155,39 +157,35 @@ __device__ __forceinline__ real score(const Args& a, int k, const double (&y)[MD
   return total / (real)a.n_net;
 }
 
-// Whether neural bound k accepts the point (outer ellipsoid, then networks).
-__device__ __forceinline__ bool neural(const Args& a, int k, const double (&x)[MD]) {
-  double y[MD];
-  if (!in_ellipsoid<true>(x, a.nc + (size_t)k * MD, a.nB + (size_t)k * MD * MD, y)) return false;
-  return !a.has_net || score(a, k, y) > a.thr[k];
+// Whether neural bound k accepts point p (outer ellipsoid, then networks).
+__device__ __forceinline__ bool neural(const Args& a, long long p, int k) {
+  if (!a.has_net) return in_outer(a, p, k);
+  real xn[MD];
+  if (!in_ellipsoid<true>(a, p, a.nc + (size_t)k * MD, a.nB + (size_t)k * MD * MD, a.nmean + (size_t)k * MD,
+                          a.nscale + (size_t)k * MD, xn))
+    return false;
+  return score(a, k, xn) > a.thr[k];
 }
 
-__global__ void __launch_bounds__(THREADS) accept_kernel(Args a) {
+__device__ __forceinline__ void accept_body(const Args& a) {
   __shared__ int list[THREADS];
   __shared__ uint64_t todo_list[THREADS];
   __shared__ int count;
   if (threadIdx.x == 0) count = 0;
   __syncthreads();
   const long long p = (long long)blockIdx.x * THREADS + threadIdx.x;
-  bool kept = false;
   uint64_t todo = 0;
   if (p < a.n) {
-    double x[MD], unused[MD];
-    uint64_t outside;
-    load_point(a, p, x, outside);
+    const uint64_t outside = outside_mask(a, p);
     int n_bound = 0;
-    for (int m = 0; m < a.M; ++m)
-      if ((outside & a.mcube[m]) == 0 &&
-          in_ellipsoid<false>(x, a.mc + (size_t)m * MD, a.mB + (size_t)m * MD * MD, unused))
-        ++n_bound;
-    kept = a.u[p] > 1.0 - 1.0 / (double)n_bound;
+    for (int m = 0; m < a.M; ++m) n_bound += in_mixture(a, p, outside, m);
+    bool kept = a.u[p] > 1.0 - 1.0 / (double)n_bound;
     if (a.union_cube && outside != 0) kept = false;
     a.keep[p] = kept;
     if (kept)
       for (int k = 0; k < a.K; ++k)
-        if (in_ellipsoid<false>(x, a.nc + (size_t)k * MD, a.nB + (size_t)k * MD * MD, unused))
-          todo |= (uint64_t)1 << k;
-    if (!a.has_net || a.K == 0 || todo == 0) a.accept[p] = a.K == 0 ? kept : (kept && todo != 0);
+        if (in_outer(a, p, k)) todo |= (uint64_t)1 << k;
+    if (!a.has_net || todo == 0) a.accept[p] = a.K == 0 ? kept : todo != 0;
   }
   if (a.has_net && todo != 0) {
     const int slot = atomicAdd(&count, 1);
@@ -196,37 +194,35 @@ __global__ void __launch_bounds__(THREADS) accept_kernel(Args a) {
   }
   __syncthreads();
   if (!a.has_net || (int)threadIdx.x >= count) return;
+  // Points that need the networks, compacted: full wavefronts run the network loop.
   const long long q = (long long)blockIdx.x * THREADS + list[threadIdx.x];
   const uint64_t mask = todo_list[threadIdx.x];
-  double x[MD];
-  uint64_t outside;
-  load_point(a, q, x, outside);
   bool acc = false;
   for (int k = 0; k < a.K; ++k) {
     if (!acc && ((mask >> k) & 1)) {
-      double y[MD];
-      in_ellipsoid<true>(x, a.nc + (size_t)k * MD, a.nB + (size_t)k * MD * MD, y);
-      acc = score(a, k, y) > a.thr[k];
+      real xn[MD];
+      in_ellipsoid<true>(a, q, a.nc + (size_t)k * MD, a.nB + (size_t)k * MD * MD, a.nmean + (size_t)k * MD,
+                         a.nscale + (size_t)k * MD, xn);
+      acc = score(a, k, xn) > a.thr[k];
     }
   }
   a.accept[q] = acc;
 }
 
-__global__ void __launch_bounds__(THREADS) highest_kernel(Args a) {
+__device__ __forceinline__ void highest_body(const Args& a) {
   const long long p = (long long)blockIdx.x * THREADS + threadIdx.x;
   const bool live = p < a.n;
-  double x[MD];
-  uint64_t outside = 0;
-  if (live) load_point(a, p, x, outside);
+  const uint64_t outside = live ? outside_mask(a, p) : 0;
   long long result = -1;
   bool done = !live;
   for (int j = a.J - 1; j >= 0; --j) {
-    if (!done) {
-      bool in = in_union(a, x, outside, (int)a.mstart[j], (int)a.mstart[j + 1]);
-      if (a.bcube[j] && outside != 0) in = false;
+    if (!done && !(a.bcube[j] && outside != 0)) {
+      bool in = false;
+      for (int m = (int)a.mstart[j]; m < (int)a.mstart[j + 1]; ++m)
+        if (!in) in = in_mixture(a, p, outside, m);
       if (in) {
         for (int k = (int)a.nstart[j]; k < (int)a.nstart[j + 1]; ++k) {
-          if (!done && neural(a, k, x)) {
+          if (!done && neural(a, p, k)) {
             done = true;
             result = a.first + j;
           }
@@ -238,15 +234,66 @@ __global__ void __launch_bounds__(THREADS) highest_kernel(Args a) {
   if (live) a.result[p] = result;
 }
 
-void unpack(Args& a, const long long* ip, void* const* ptr) {
-  a.x = (const double*)ptr[0]; a.u = (const double*)ptr[1]; a.mc = (const double*)ptr[2];
-  a.mB = (const double*)ptr[3]; a.mcube = (const uint64_t*)ptr[4]; a.nc = (const double*)ptr[5];
-  a.nB = (const double*)ptr[6]; a.nmean = (const double*)ptr[7]; a.nscale = (const double*)ptr[8];
-  a.w = (const real*)ptr[9]; a.thr = (const real*)ptr[10]; a.mstart = (const long long*)ptr[11];
-  a.nstart = (const long long*)ptr[12]; a.bcube = (const unsigned char*)ptr[13];
-  a.keep = (unsigned char*)ptr[14]; a.accept = (unsigned char*)ptr[15]; a.result = (long long*)ptr[16];
-  a.n = ip[0]; a.d = (int)ip[1]; a.M = (int)ip[2]; a.K = (int)ip[3]; a.H1 = (int)ip[4]; a.n_net = (int)ip[5];
-  a.NPW = (int)ip[6]; a.union_cube = (int)ip[7]; a.has_net = (int)ip[8]; a.J = (int)ip[9]; a.first = ip[10];
+struct Dims {
+  long long n, first;
+  int d, M, K, H1, n_net, NPW, union_cube, has_net, J;
+};
+
+// The pointers are separate __restrict__ kernel arguments, so that the compiler can prove the ellipsoids and
+// network parameters unmodified and read them with scalar (wavefront-uniform) loads.
+#define DK_PARAMS                                                                                                   \
+  const double *__restrict__ x, const double *__restrict__ u, const double *__restrict__ mc,                         \
+      const double *__restrict__ mB, const uint64_t *__restrict__ mcube, const double *__restrict__ nc,              \
+      const double *__restrict__ nB, const double *__restrict__ nmean, const double *__restrict__ nscale,           \
+      const real *__restrict__ w, const real *__restrict__ thr, const long long *__restrict__ mstart,               \
+      const long long *__restrict__ nstart, const unsigned char *__restrict__ bcube, unsigned char *__restrict__ keep, \
+      unsigned char *__restrict__ accept, long long *__restrict__ result, Dims dm
+
+__device__ __forceinline__ Args assemble(DK_PARAMS) {
+  Args a;
+  a.x = x; a.u = u; a.mc = mc; a.mB = mB; a.mcube = mcube; a.nc = nc; a.nB = nB; a.nmean = nmean;
+  a.nscale = nscale; a.w = w; a.thr = thr; a.mstart = mstart; a.nstart = nstart; a.bcube = bcube; a.keep = keep;
+  a.accept = accept; a.result = result;
+  a.n = dm.n; a.first = dm.first; a.d = dm.d; a.M = dm.M; a.K = dm.K; a.H1 = dm.H1; a.n_net = dm.n_net;
+  a.NPW = dm.NPW; a.union_cube = dm.union_cube; a.has_net = dm.has_net; a.J = dm.J;
+  return a;
+}
+
+#define DK_ARGS x, u, mc, mB, mcube, nc, nB, nmean, nscale, w, thr, mstart, nstart, bcube, keep, accept, result, dm
+
+__global__ void __launch_bounds__(THREADS, DK_WAVES) accept_kernel(DK_PARAMS) { accept_body(assemble(DK_ARGS)); }
+
+__global__ void __launch_bounds__(THREADS, DK_WAVES) highest_kernel(DK_PARAMS) { highest_body(assemble(DK_ARGS)); }
+
+int launch(bool highest, const long long* ip, void* const* ptr, void* stream) {
+  Dims dm;
+  dm.n = ip[0]; dm.d = (int)ip[1]; dm.M = (int)ip[2]; dm.K = (int)ip[3]; dm.H1 = (int)ip[4]; dm.n_net = (int)ip[5];
+  dm.NPW = (int)ip[6]; dm.union_cube = (int)ip[7]; dm.has_net = (int)ip[8]; dm.J = (int)ip[9]; dm.first = ip[10];
+  if (dm.d > MD || dm.d > 64 || dm.K > 64) return (int)hipErrorInvalidValue;
+  if (dm.n == 0) return 0;
+  const double* x = (const double*)ptr[0];
+  const double* u = (const double*)ptr[1];
+  const double* mc = (const double*)ptr[2];
+  const double* mB = (const double*)ptr[3];
+  const uint64_t* mcube = (const uint64_t*)ptr[4];
+  const double* nc = (const double*)ptr[5];
+  const double* nB = (const double*)ptr[6];
+  const double* nmean = (const double*)ptr[7];
+  const double* nscale = (const double*)ptr[8];
+  const real* w = (const real*)ptr[9];
+  const real* thr = (const real*)ptr[10];
+  const long long* mstart = (const long long*)ptr[11];
+  const long long* nstart = (const long long*)ptr[12];
+  const unsigned char* bcube = (const unsigned char*)ptr[13];
+  unsigned char* keep = (unsigned char*)ptr[14];
+  unsigned char* accept = (unsigned char*)ptr[15];
+  long long* result = (long long*)ptr[16];
+  const dim3 grid((unsigned)((dm.n + THREADS - 1) / THREADS)), block(THREADS);
+  if (highest)
+    hipLaunchKernelGGL(highest_kernel, grid, block, 0, (hipStream_t)stream, DK_ARGS);
+  else
+    hipLaunchKernelGGL(accept_kernel, grid, block, 0, (hipStream_t)stream, DK_ARGS);
+  return (int)hipGetLastError();
 }
 }  // namespace
 
@@ -260,23 +307,7 @@ const char* dk_error(int e) { return hipGetErrorString((hipError_t)e); }
 // ip: n, d, M, K, H1, n_net, NPW, union_cube, has_net, J, first. ptr: x, u, mc, mB, mcube, nc, nB, nmean, nscale,
 // w, thr, mstart, nstart, bcube, keep, accept, result (unused ones may be null). Launch on `stream` without
 // waiting; returns 0 or a HIP error code.
-int dk_accept(const long long* ip, void* const* ptr, void* stream) {
-  Args a;
-  unpack(a, ip, ptr);
-  if (a.d > MD || a.K > 64) return (int)hipErrorInvalidValue;
-  if (a.n == 0) return 0;
-  hipLaunchKernelGGL(accept_kernel, dim3((unsigned)((a.n + THREADS - 1) / THREADS)), dim3(THREADS), 0,
-                     (hipStream_t)stream, a);
-  return (int)hipGetLastError();
-}
+int dk_accept(const long long* ip, void* const* ptr, void* stream) { return launch(false, ip, ptr, stream); }
 
-int dk_highest(const long long* ip, void* const* ptr, void* stream) {
-  Args a;
-  unpack(a, ip, ptr);
-  if (a.d > MD) return (int)hipErrorInvalidValue;
-  if (a.n == 0) return 0;
-  hipLaunchKernelGGL(highest_kernel, dim3((unsigned)((a.n + THREADS - 1) / THREADS)), dim3(THREADS), 0,
-                     (hipStream_t)stream, a);
-  return (int)hipGetLastError();
-}
+int dk_highest(const long long* ip, void* const* ptr, void* stream) { return launch(true, ip, ptr, stream); }
 }
