@@ -220,16 +220,14 @@ def test_torch_seed_per_bound_resume(tmp_path):
     assert not np.allclose(weights[0], weights[1])
 
 
-@pytest.mark.parametrize('first_block,chunk', [(1, None), (3, 2**10),
-                                                (1000, None)])
-def test_highest_bound_matches_loop(monkeypatch, first_block, chunk):
+@pytest.mark.parametrize('chunk', [None, 2**10])
+def test_highest_bound_matches_loop(monkeypatch, chunk):
     # The batched device test of the bounds in sample_shell and
     # shell_association agrees with testing each bound in turn, including
-    # periodic phase shifts and points outside the unit cube, for any block
-    # size of the network evaluation and with chunked evaluation.
+    # periodic phase shifts and points outside the unit cube, also with
+    # chunked evaluation.
     pytest.importorskip('torch')
     from nautilus import _torch
-    monkeypatch.setattr(_torch, 'FIRST_BLOCK', first_block)
     if chunk is not None:
         monkeypatch.setattr(_torch, 'NETWORK_CHUNK', chunk)
         monkeypatch.setattr(_torch, 'ELLIPSOID_CHUNK', 64 * chunk)

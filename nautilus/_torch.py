@@ -34,9 +34,6 @@ ELLIPSOID_CHUNK = 2**23
 # Maximum number of first-layer activations (neural bounds x points x
 # networks x units) held at once when testing neural bounds.
 NETWORK_CHUNK = 2**24
-# Number of neural bounds whose networks `highest_bound` evaluates in its
-# first block; each further block is twice as large.
-FIRST_BLOCK = 1
 # Maximum number of minibatch steps per CUDA graph. An epoch is captured as
 # consecutive graphs sharing one memory pool, which bounds the pool to the
 # temporaries of this many steps instead of a whole epoch.
@@ -898,33 +895,20 @@ def _highest(networks, k_0, x_t, todo, level):
     if networks is None:
         return torch.amax(torch.where(todo, level[:, None], -1), dim=0)
     n_bounds, n_points = todo.shape
-    # Networks are evaluated in blocks of neural bounds from the highest
-    # level down, each block twice as large as the previous one, on the
-    # points not yet in a higher bound that lie in the outer ellipsoid of a
-    # neural bound of the block. Selecting these points waits for the device
-    # once per block. An extra dummy point, inside no outer ellipsoid, is
-    # selected whenever lower blocks have such points left; without any
-    # selected point, the search stops.
-    todo = torch.cat([todo, torch.zeros_like(todo[:, :1])], dim=1)
-    result = torch.full((n_points + 1, ), -1, dtype=level.dtype,
+    # The networks of all neural bounds are evaluated in one pass on the
+    # points inside any outer ellipsoid: one wait for the device and a fixed
+    # number of launches, instead of a block search from the highest level
+    # down that waited once per block.
+    result = torch.full((n_points, ), -1, dtype=level.dtype,
                         device=todo.device)
-    k_1, size = n_bounds, FIRST_BLOCK
-    while k_1 > 0:
-        k = max(k_1 - size, 0)
-        todo = todo[:k_1] & (result < 0)
-        select = torch.any(todo[k:], dim=0)
-        select[n_points] = torch.any(todo[:k])
-        rows = torch.nonzero(select)[:, 0]
-        if len(rows) == 0:
-            break
-        accept = todo[k:, rows] & (_scores(
-            networks, k_0 + k, k_0 + k_1,
-            x_t[k:k_1, rows.clamp(max=n_points - 1)]) > networks[
-                'threshold'][k_0 + k:k_0 + k_1, None])
-        result[rows] = torch.amax(torch.where(accept, level[k:k_1, None], -1),
-                                  dim=0)
-        k_1, size = k, 2 * size
-    return result[:n_points]
+    rows = torch.nonzero(torch.any(todo, dim=0))[:, 0]
+    if len(rows) == 0:
+        return result
+    accept = todo[:, rows] & (_scores(
+        networks, k_0, k_0 + n_bounds, x_t[:, rows]) > networks[
+            'threshold'][k_0:k_0 + n_bounds, None])
+    result[rows] = torch.amax(torch.where(accept, level[:, None], -1), dim=0)
+    return result
 
 
 def highest_bound(sampler, points, start, stop):
@@ -934,8 +918,8 @@ def highest_bound(sampler, points, start, stop):
     Replaces the loops over bounds in `Sampler.sample_shell` and
     `Sampler.shell_association`. The ellipsoids of all bounds are tested in
     one batched transform. The networks of the neural bounds are then
-    evaluated in a few blocks from the last bound down (see `_highest`). One
-    copy goes to the device and one back.
+    evaluated in one pass (see `_highest`). One copy goes to the device and
+    one back.
 
     Parameters
     ----------
