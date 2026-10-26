@@ -220,16 +220,14 @@ def test_torch_seed_per_bound_resume(tmp_path):
     assert not np.allclose(weights[0], weights[1])
 
 
-@pytest.mark.parametrize('first_block,chunk', [(1, None), (3, 2**10),
-                                                (1000, None)])
-def test_highest_bound_matches_loop(monkeypatch, first_block, chunk):
+@pytest.mark.parametrize('chunk', [None, 2**10])
+def test_highest_bound_matches_loop(monkeypatch, chunk):
     # The batched device test of the bounds in sample_shell and
     # shell_association agrees with testing each bound in turn, including
-    # periodic phase shifts and points outside the unit cube, for any block
-    # size of the network evaluation and with chunked evaluation.
+    # periodic phase shifts and points outside the unit cube, also with
+    # chunked evaluation.
     pytest.importorskip('torch')
     from nautilus import _torch
-    monkeypatch.setattr(_torch, 'FIRST_BLOCK', first_block)
     if chunk is not None:
         monkeypatch.setattr(_torch, 'NETWORK_CHUNK', chunk)
         monkeypatch.setattr(_torch, 'ELLIPSOID_CHUNK', 64 * chunk)
@@ -746,3 +744,44 @@ def test_draw_kernel_decisions(monkeypatch, nn_dtype):
             assert np.array_equal(points, previous[0])
             assert n_keep == previous[1]
         previous = points, n_keep
+
+
+def test_transfer_association_from_lowest_candidate_shell(monkeypatch):
+    # sample_shell on the torch backend associates drawn points with shells
+    # only from the lowest shell still holding transfer candidates up (and
+    # not at all once none is left). The run is bitwise the one with the
+    # association over all shells.
+    pytest.importorskip('torch')
+    from nautilus import _torch
+
+    def likelihood(x):
+        return np.logaddexp(-np.sum((x - 0.3)**2, axis=-1) / 0.005,
+                            -np.sum((x - 0.75)**2, axis=-1) / 0.005)
+
+    highest_bound = _torch.highest_bound
+    starts = []
+
+    def run(full):
+        def wrapped(sampler, points, start, stop):
+            if stop == len(sampler.bounds) - 1:  # the transfer association
+                starts.append(start)
+                if full:
+                    start = 0
+            return highest_bound(sampler, points, start, stop)
+
+        monkeypatch.setattr(_torch, 'highest_bound', wrapped)
+        sampler = Sampler(lambda x: x, likelihood, n_dim=3, n_live=100,
+                          n_networks=1, vectorized=True, seed=0,
+                          backend='torch')
+        sampler.run(n_eff=200, verbose=False)
+        return sampler
+
+    full = run(True)
+    starts.clear()
+    part = run(False)
+    assert max(starts) > 0
+    assert part.n_like == full.n_like
+    assert len(part.bounds) == len(full.bounds)
+    assert part.log_z == full.log_z
+    for a, b in zip(part.posterior(), full.posterior()):
+        assert np.array_equal(a, b)
