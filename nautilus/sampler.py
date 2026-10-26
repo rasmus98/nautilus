@@ -845,9 +845,21 @@ class Sampler:
                 # Replace points for which we can use transfer points.
                 replace = np.zeros(len(points), dtype=bool)
                 if shell_t is not None and len(shell_t) > 0:
-                    shell_p = self.shell_association(
-                        points, n_max=len(self.bounds) - 1)
-                    for shell in range(len(self.bounds) - 1):
+                    if self.device is not None:
+                        # Only shells still holding transfer candidates can
+                        # take a point (any other shell draws nothing), so
+                        # the association is needed only from the lowest of
+                        # them up, and not at all once none is left.
+                        from ._torch import highest_bound
+                        shells = np.unique(shell_t[shell_t >= 0])
+                        if len(shells) > 0:
+                            shell_p = highest_bound(
+                                self, points, shells[0], len(self.bounds) - 1)
+                    else:
+                        shells = range(len(self.bounds) - 1)
+                        shell_p = self.shell_association(
+                            points, n_max=len(self.bounds) - 1)
+                    for shell in shells:
                         idx_1 = np.flatnonzero(shell_t == shell)
                         idx_2 = np.flatnonzero(shell_p == shell)
                         n = min(len(idx_1), len(idx_2))

@@ -582,3 +582,44 @@ def test_warm_up_keeps_no_state():
     seconds = _torch.warm_up('cpu')
     assert set(seconds) == {'mvee'}
     assert [id(entry) for entry in basic._MVEE_CACHE] == cache
+
+
+def test_transfer_association_from_lowest_candidate_shell(monkeypatch):
+    # sample_shell on the torch backend associates drawn points with shells
+    # only from the lowest shell still holding transfer candidates up (and
+    # not at all once none is left). The run is bitwise the one with the
+    # association over all shells.
+    pytest.importorskip('torch')
+    from nautilus import _torch
+
+    def likelihood(x):
+        return np.logaddexp(-np.sum((x - 0.3)**2, axis=-1) / 0.005,
+                            -np.sum((x - 0.75)**2, axis=-1) / 0.005)
+
+    highest_bound = _torch.highest_bound
+    starts = []
+
+    def run(full):
+        def wrapped(sampler, points, start, stop):
+            if stop == len(sampler.bounds) - 1:  # the transfer association
+                starts.append(start)
+                if full:
+                    start = 0
+            return highest_bound(sampler, points, start, stop)
+
+        monkeypatch.setattr(_torch, 'highest_bound', wrapped)
+        sampler = Sampler(lambda x: x, likelihood, n_dim=3, n_live=100,
+                          n_networks=1, vectorized=True, seed=0,
+                          backend='torch')
+        sampler.run(n_eff=200, verbose=False)
+        return sampler
+
+    full = run(True)
+    starts.clear()
+    part = run(False)
+    assert max(starts) > 0
+    assert part.n_like == full.n_like
+    assert len(part.bounds) == len(full.bounds)
+    assert part.log_z == full.log_z
+    for a, b in zip(part.posterior(), full.posterior()):
+        assert np.array_equal(a, b)
