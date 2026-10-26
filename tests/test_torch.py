@@ -570,3 +570,15 @@ def test_union_split_device_matches_numpy():
         assert np.allclose(a.c, b.c, rtol=1e-9)
         assert np.allclose(a.A, b.A, rtol=1e-7)
     assert rngs[0].bit_generator.state == rngs[1].bit_generator.state
+
+
+def test_warm_up_keeps_no_state():
+    # The warm-up compiles and loads only: the MVEE cache is as before.
+    pytest.importorskip('torch')
+    from nautilus import _torch
+    from nautilus.bounds import basic
+    basic.minimum_volume_enclosing_ellipsoid_batched(np.eye(6, 2) + 0.5)
+    cache = [id(entry) for entry in basic._MVEE_CACHE]
+    seconds = _torch.warm_up('cpu')
+    assert set(seconds) == {'mvee'}
+    assert [id(entry) for entry in basic._MVEE_CACHE] == cache

@@ -513,6 +513,65 @@ def predict(emulator, x):
     return y.double()
 
 
+def warm_up(device, n_dim=32, n_networks=4, hidden=(100, 50, 20), n=256):
+    """Pay a process's one-time start-up costs before its first run.
+
+    These are the numba compilation of the batched MVEE kernel (a few
+    seconds unless numba's cache hits) and, on a GPU, loading the matrix
+    product code of the network evaluation in float32 and float64 (up to
+    seconds per data type on a cold node). Call it where it overlaps other
+    work, e.g. when a worker process starts. Nothing it computes is kept
+    and it draws no random numbers, so no run depends on it.
+
+    Parameters
+    ----------
+    device : str or torch.device
+        Device of the later runs.
+    n_dim, n_networks, hidden, n : int, int, tuple, int, optional
+        Shapes of the warm-up products: dimensions, networks, hidden
+        layers and rows, as in a `predict` call.
+
+    Returns
+    -------
+    seconds : dict
+        Wall time of each part: 'mvee' and, on a GPU, one per data type.
+
+    """
+    import time
+
+    from .bounds import basic
+
+    seconds = {}
+    start = time.perf_counter()
+    points = np.linspace(0.0, 1.0, 2 * 3 * 4).reshape(-1, 3)
+    points[:, 1] **= 2
+    points[:, 2] **= 3
+    cache = list(basic._MVEE_CACHE)
+    basic.minimum_volume_enclosing_ellipsoid_batched(points)
+    basic._MVEE_CACHE[:] = cache
+    seconds['mvee'] = time.perf_counter() - start
+    device = torch.device(device)
+    if device.type != 'cuda':
+        return seconds
+    units = [n_dim] + list(hidden) + [1]
+    for dtype in (torch.float32, torch.float64):
+        start = time.perf_counter()
+        with torch.inference_mode():
+            h = torch.ones((n, n_dim), dtype=dtype, device=device) @ \
+                torch.ones((n_dim, n_networks * units[1]), dtype=dtype,
+                           device=device)
+            h = h.view(n, n_networks, units[1]).transpose(0, 1) + 1
+            for k in range(1, len(units) - 1):
+                h = torch.baddbmm(
+                    torch.ones((n_networks, 1, units[k + 1]), dtype=dtype,
+                               device=device), torch.relu(h),
+                    torch.ones((n_networks, units[k], units[k + 1]),
+                               dtype=dtype, device=device))
+            torch.cuda.synchronize(device)
+        seconds[str(dtype).split('.')[-1]] = time.perf_counter() - start
+    return seconds
+
+
 def _params(bound, device, keys):
     """Return attributes of a bound as tensors, cached on the bound."""
     cache = bound.__dict__.setdefault('_torch_cache', {})
