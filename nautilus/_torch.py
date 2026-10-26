@@ -526,7 +526,8 @@ def warm_up(device, n_dim=32, n_networks=4, hidden=(100, 50, 20), n=256):
     These are the numba compilation of the batched MVEE kernel (a few
     seconds unless numba's cache hits) and, on a GPU, loading the matrix
     product code of the network evaluation in float32 and float64 (up to
-    seconds per data type on a cold node). Call it where it overlaps other
+    seconds per data type on a cold node) and the float32 training kernel
+    (its build or cached load and first launch; skipped where unsupported). Call it where it overlaps other
     work, e.g. when a worker process starts. Nothing it computes is kept
     and it draws no random numbers, so no run depends on it.
 
@@ -541,7 +542,8 @@ def warm_up(device, n_dim=32, n_networks=4, hidden=(100, 50, 20), n=256):
     Returns
     -------
     seconds : dict
-        Wall time of each part: 'mvee' and, on a GPU, one per data type.
+        Wall time of each part: 'mvee' and, on a GPU, one per data type and
+        'train'.
 
     """
     import time
@@ -576,6 +578,18 @@ def warm_up(device, n_dim=32, n_networks=4, hidden=(100, 50, 20), n=256):
                                dtype=dtype, device=device))
             torch.cuda.synchronize(device)
         seconds[str(dtype).split('.')[-1]] = time.perf_counter() - start
+    global NN_DTYPE
+    dtype, NN_DTYPE = NN_DTYPE, torch.float32
+    start = time.perf_counter()
+    try:  # the float32 training kernel's load and first launch
+        x = torch.linspace(0.0, 1.0, n * n_dim, dtype=NN_DTYPE,
+                           device=device).view(n, n_dim)
+        _train_kernel(x, x.sum(dim=1), units, n_networks, MLPRegressor(
+            hidden_layer_sizes=hidden, max_iter=2), 0, min(200, n))
+        torch.cuda.synchronize(device)
+    finally:
+        NN_DTYPE = dtype
+    seconds['train'] = time.perf_counter() - start
     return seconds
 
 
