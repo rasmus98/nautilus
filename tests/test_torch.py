@@ -582,3 +582,167 @@ def test_warm_up_keeps_no_state():
     seconds = _torch.warm_up('cpu')
     assert set(seconds) == {'mvee'}
     assert [id(entry) for entry in basic._MVEE_CACHE] == cache
+
+
+def _two_mode_sampler(n_dim=3, device='cpu', **kwargs):
+    def likelihood(x):
+        return np.logaddexp(-np.sum((x - 0.3)**2, axis=-1) / 0.005,
+                            -np.sum((x - 0.75)**2, axis=-1) / 0.005)
+
+    sampler = Sampler(lambda x: x, likelihood, n_dim=n_dim, n_live=200,
+                      vectorized=True, seed=0, backend='torch', device=device,
+                      **kwargs)
+    sampler.run(n_like_max=3000, verbose=False)
+    return sampler
+
+
+def test_draw_kernel_switch_and_fallback(monkeypatch):
+    # DRAW_KERNEL is off by default. When on, cases the HIP kernels do not
+    # support (here: a CPU device, then a failed launch) use the torch path
+    # after one warning per reason, with identical results.
+    torch = pytest.importorskip('torch')
+    from nautilus import _drawkernel, _torch
+    assert _torch.DRAW_KERNEL is False
+    monkeypatch.setattr(_drawkernel, '_WARNED', set())
+    sampler = _two_mode_sampler()
+    bound = sampler.bounds[-1]
+    x = np.random.default_rng(0).random((3000, 3))
+
+    def run():
+        bound.reset(np.random.default_rng(5))
+        points, n_keep = _torch.sample(bound, 2000)
+        return points, n_keep, [_torch.highest_bound(
+            sampler, x, index, len(sampler.bounds)) for index in range(
+                len(sampler.bounds))]
+
+    reference = run()
+    monkeypatch.setattr(_torch, 'DRAW_KERNEL', True)
+    with pytest.warns(RuntimeWarning, match='needs an AMD GPU'):
+        result = run()
+    assert len(_drawkernel._WARNED) == 1
+    assert np.array_equal(result[0], reference[0])
+    assert result[1] == reference[1]
+    for a, b in zip(result[2], reference[2]):
+        assert np.array_equal(a, b)
+
+    # A failed launch after the points are drawn falls back to the same
+    # decisions on the same points.
+    def fail(*args):
+        raise _drawkernel.Unsupported('launch failed: test')
+
+    monkeypatch.setattr(_drawkernel, 'library', lambda *args: None)
+    monkeypatch.setattr(_drawkernel, '_launch', fail)
+    with pytest.warns(RuntimeWarning, match='launch failed: test'):
+        result = run()
+    assert np.array_equal(result[0], reference[0])
+    assert result[1] == reference[1]
+    for a, b in zip(result[2], reference[2]):
+        assert np.array_equal(a, b)
+    assert torch is not None
+
+
+def test_draw_kernel_cache_path_and_pack(tmp_path):
+    # Library paths differ per source, architecture, dtype and padded shape;
+    # packing pads the ellipsoids and lays out each network's parameters as
+    # the kernel reads them.
+    torch = pytest.importorskip('torch')
+    from nautilus import _drawkernel, _torch
+    paths = {_drawkernel.cache_path(b'src', 'gfx90a:sramecc+:xnack-', dtype,
+                                    md, 50, 20, tmp_path) for dtype in
+             (torch.float32, torch.float64) for md in (32, 36)}
+    paths.add(_drawkernel.cache_path(b'other', 'gfx90a', torch.float32, 32,
+                                     50, 20, tmp_path))
+    assert len(paths) == 5
+    assert _drawkernel.padded(29) == 32 and _drawkernel.padded(33) == 36
+
+    sampler = _two_mode_sampler()
+    stack = _torch._stack_bounds(sampler)
+    packed = _drawkernel.pack(stack, 3, _torch.NN_DTYPE)
+    assert _drawkernel.pack(stack, 3, _torch.NN_DTYPE) is packed
+    md, (h1, h2, h3) = packed['md'], packed['shapes']
+    assert (md, h1, h2, h3) == (4, 100, 50, 20)
+    k, n_net = len(stack['c_n']), stack['networks']['n_networks']
+    assert packed['w'].shape == (k, n_net, h1 * md + h1 + h1 * h2 + h2 +
+                                 h2 * h3 + h3 + h3 + 1)
+    # The packed parameters reproduce _torch._scores.
+    x_t = torch.rand((k, 50, 3), dtype=torch.float64) * 2 - 1
+    reference = _torch._scores(stack['networks'], 0, k, x_t)
+    for b in range(k):
+        h = ((x_t[b] - packed['mean'][b, :3]) / packed['scale'][b, :3]).to(
+            packed['w'].dtype)
+        total = 0
+        for net in range(n_net):
+            w = packed['w'][b, net]
+            w0 = w[:h1 * md].view(h1, md)[:, :3]
+            o = h1 * md
+            b0 = w[o:o + h1]
+            o += h1
+            w1 = w[o:o + h1 * h2].view(h1, h2)
+            o += h1 * h2
+            b1 = w[o:o + h2]
+            o += h2
+            w2 = w[o:o + h2 * h3].view(h2, h3)
+            o += h2 * h3
+            b2 = w[o:o + h3]
+            o += h3
+            w3, b3 = w[o:o + h3], w[o + h3]
+            a = torch.relu(h @ w0.T + b0)
+            a = torch.relu(a @ w1 + b1)
+            a = torch.relu(a @ w2 + b2)
+            total = total + a @ w3 + b3
+        assert torch.allclose(total / n_net, reference[b], rtol=1e-5,
+                              atol=1e-6)
+    masks = packed['mcube'].cpu().numpy()
+    dim_cube = stack['dim_cube'].cpu().numpy()
+    assert np.array_equal(masks, np.sum(dim_cube * 2**np.arange(3), axis=1))
+
+
+@pytest.mark.parametrize('nn_dtype', ['float32', 'float64'])
+def test_draw_kernel_decisions(monkeypatch, nn_dtype):
+    # On an AMD GPU the kernels' keep, accept and highest-bound decisions
+    # equal the torch path's on the same points (no point of this case lies
+    # within rounding of a surface or threshold), so the draws are identical.
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip('needs an AMD GPU')
+    from nautilus import _drawkernel, _torch
+    monkeypatch.setattr(_torch, 'NN_DTYPE', getattr(torch, nn_dtype))
+    monkeypatch.setattr(_drawkernel, '_WARNED', set())
+    monkeypatch.setattr(_drawkernel, 'HIGHEST', True)
+    sampler = _two_mode_sampler(n_dim=5, device='cuda')
+    assert any(len(b.neural_bounds) > 1 for b in sampler.bounds[1:])
+    x = np.random.default_rng(0).random((20000, 5)) * 1.2 - 0.1
+    reference = [_torch.highest_bound(sampler, x, index, len(sampler.bounds))
+                 for index in range(len(sampler.bounds))]
+    monkeypatch.setattr(_torch, 'DRAW_KERNEL', True)
+    result = [_torch.highest_bound(sampler, x, index, len(sampler.bounds))
+              for index in range(len(sampler.bounds))]
+    assert not _drawkernel._WARNED
+    for a, b in zip(result, reference):
+        assert np.array_equal(a, b)
+    for bound in sampler.bounds[1:]:
+        gen = torch.Generator(device='cuda').manual_seed(1)
+        x_d, u = _torch._union_points(bound.outer_bound, 50000, gen)
+        packed = _torch._draw_kernel_pack(_torch._bound_stack(bound), 5)
+        keep, accept = _drawkernel.accept(
+            packed, x_d, u, bound.outer_bound.cube is not None)
+        n_bound = sum(_torch._contains(b, x_d).to(torch.float64) for b in
+                      bound.outer_bound.bounds)
+        keep_ref = u > 1 - 1.0 / n_bound
+        if bound.outer_bound.cube is not None:
+            keep_ref &= torch.all((x_d >= 0) & (x_d < 1), dim=-1)
+        assert torch.equal(keep, keep_ref)
+        accept_ref = keep_ref.clone()
+        if len(bound.neural_bounds) > 0:
+            accept_ref[keep_ref] = _torch._neural_accept(
+                _torch._bound_stack(bound), x_d[keep_ref])
+        assert torch.equal(accept, accept_ref)
+    for draw_kernel in [False, True]:
+        monkeypatch.setattr(_torch, 'DRAW_KERNEL', draw_kernel)
+        bound = sampler.bounds[-1]
+        bound.reset(np.random.default_rng(5))
+        points, n_keep = _torch.sample(bound, 5000)
+        if draw_kernel:
+            assert np.array_equal(points, previous[0])
+            assert n_keep == previous[1]
+        previous = points, n_keep
