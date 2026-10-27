@@ -55,8 +55,8 @@ TRAIN_KERNEL = False
 # rounding of a bound's surface or a network threshold. Cases the kernels do
 # not support use the torch path, with one warning per reason.
 DRAW_KERNEL = False
-# Fewest networks the trainer keeps stacked when it drops stopped ones (see
-# `_train_graphs`).
+# Fewest networks the eager trainer keeps stacked when it drops stopped ones
+# (see `_train_graphs`).
 _MIN_STACK = 2
 
 
@@ -270,12 +270,13 @@ def _train_graphs(x, y, params, network, gen, batch_size):
                 active, torch.fmin(best_loss, loss_epoch), best_loss))
             active.logical_and_(no_improvement <= network.n_iter_no_change)
 
-    # Networks that stopped are dropped from the stack at the next check
-    # (every epoch eagerly, every CHECK_EVERY epochs on CUDA devices, where
-    # the epoch graphs are then re-captured for the smaller stack); the
-    # caller's `params` and the full-size best loss receive their final
-    # values. Stopped networks are frozen either way (the Adam step is
-    # multiplied by `active`), so this only saves their compute. The stack
+    # Eagerly (not on CUDA devices), networks that stopped are dropped from
+    # the stack at the next epoch boundary; the caller's `params` and the
+    # full-size best loss receive their final values. Stopped networks are
+    # frozen either way (the Adam step is multiplied by `active`), so this
+    # only saves their compute. CUDA devices keep the fixed-size stack and
+    # its masked graph replay: shrinking would mean a re-capture per drop,
+    # and a device step is latency-bound rather than size-bound. The stack
     # keeps at least _MIN_STACK networks (stopped ones stay frozen in it):
     # a stack of one makes torch use unbatched matrix products, which round
     # differently from the batched ones and would change the last network.
@@ -339,9 +340,9 @@ def _train_graphs(x, y, params, network, gen, batch_size):
                 loss_curve[i, idx] = loss_epoch
         if not torch.any(active):
             break
-        if max(int(torch.sum(active)), _MIN_STACK) < len(idx):
+        if device.type != 'cuda' and max(int(torch.sum(active)),
+                                         _MIN_STACK) < len(idx):
             drop_stopped()
-            replay = None  # the graphs hold the old stack's tensors
     write_back()
     return loss_curve, active_curve, best_out
 
