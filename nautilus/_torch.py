@@ -55,6 +55,9 @@ TRAIN_KERNEL = False
 # rounding of a bound's surface or a network threshold. Cases the kernels do
 # not support use the torch path, with one warning per reason.
 DRAW_KERNEL = False
+# Fewest networks the eager trainer keeps stacked when it drops stopped ones
+# (see `_train_graphs`).
+_MIN_STACK = 2
 
 
 def train_networks(x, y, n_networks, neural_network_kwargs, device, seed=0):
@@ -267,6 +270,40 @@ def _train_graphs(x, y, params, network, gen, batch_size):
                 active, torch.fmin(best_loss, loss_epoch), best_loss))
             active.logical_and_(no_improvement <= network.n_iter_no_change)
 
+    # Eagerly (not on CUDA devices), networks that stopped are dropped from
+    # the stack at the next epoch boundary; the caller's `params` and the
+    # full-size best loss receive their final values. Stopped networks are
+    # frozen either way (the Adam step is multiplied by `active`), so this
+    # only saves their compute. CUDA devices keep the fixed-size stack and
+    # its masked graph replay: shrinking would mean a re-capture per drop,
+    # and a device step is latency-bound rather than size-bound. The stack
+    # keeps at least _MIN_STACK networks (stopped ones stay frozen in it):
+    # a stack of one makes torch use unbatched matrix products, which round
+    # differently from the batched ones and would change the last network.
+    params_out, best_out = params, best_loss
+    idx = torch.arange(n_networks, device=device)
+
+    def write_back():
+        if len(idx) < n_networks:  # else the stack is the caller's tensors
+            with torch.no_grad():
+                for p_out, p in zip(params_out, params):
+                    p_out[idx] = p
+                best_out[idx] = best_loss
+
+    def drop_stopped():
+        nonlocal params, m, v, x_perm, y_perm, active, best_loss
+        nonlocal no_improvement, loss_sum, loss_epoch, idx
+        write_back()
+        keep = active.clone()
+        keep[torch.nonzero(~keep)[:max(_MIN_STACK - int(keep.sum()), 0)]] = True
+        params = [p[keep].detach().requires_grad_(True) for p in params]
+        m = [t[keep] for t in m]
+        v = [t[keep] for t in v]
+        x_perm, y_perm = x_perm[keep], y_perm[keep]
+        best_loss, no_improvement = best_loss[keep], no_improvement[keep]
+        loss_sum, loss_epoch = loss_sum[keep], loss_epoch[keep]
+        idx, active = idx[keep], active[keep]
+
     epoch = [partial(steps, k, min(k + GRAPH_STEPS, len(slices))) for k in
              range(0, len(slices), GRAPH_STEPS)]
     replay = None
@@ -276,13 +313,20 @@ def _train_graphs(x, y, params, network, gen, batch_size):
         lr_block = _step_sizes(network, len(slices), device, epoch_0,
                                n_epochs)
         for i in range(epoch_0, epoch_0 + n_epochs):
-            perm = torch.argsort(torch.rand(
-                (n_networks, n_points), generator=gen, device=device), dim=1)
+            # Drawn for the full stack, so the shuffles of the remaining
+            # networks do not depend on which networks were dropped.
+            u = torch.rand((n_networks, n_points), generator=gen,
+                           device=device)
+            perm = torch.argsort(u if len(idx) == n_networks else u[idx],
+                                 dim=1)
             torch.index_select(x, 0, perm.view(-1),
                                out=x_perm.view(-1, n_dim))
             torch.index_select(y, 0, perm.view(-1), out=y_perm.view(-1))
             lr_epoch.copy_(lr_block[i - epoch_0])
-            active_curve[i].copy_(active)
+            if len(idx) == n_networks:
+                active_curve[i].copy_(active)
+            else:
+                active_curve[i, idx] = active
             if replay is not None:
                 replay()
             elif device.type == 'cuda':
@@ -290,10 +334,17 @@ def _train_graphs(x, y, params, network, gen, batch_size):
             else:
                 for function in epoch:
                     function()
-            loss_curve[i].copy_(loss_epoch)
+            if len(idx) == n_networks:
+                loss_curve[i].copy_(loss_epoch)
+            else:
+                loss_curve[i, idx] = loss_epoch
         if not torch.any(active):
             break
-    return loss_curve, active_curve, best_loss
+        if device.type != 'cuda' and max(int(torch.sum(active)),
+                                         _MIN_STACK) < len(idx):
+            drop_stopped()
+    write_back()
+    return loss_curve, active_curve, best_out
 
 
 def capture(functions):

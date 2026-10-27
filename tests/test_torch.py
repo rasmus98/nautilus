@@ -785,3 +785,23 @@ def test_transfer_association_from_lowest_candidate_shell(monkeypatch):
     assert part.log_z == full.log_z
     for a, b in zip(part.posterior(), full.posterior()):
         assert np.array_equal(a, b)
+
+
+def test_dropping_stopped_networks_is_exact(monkeypatch):
+    # Eagerly, networks that stopped leave the stack; the remaining ones and
+    # the final weights, curves and best losses are bitwise those of the
+    # full masked stack (dropping disabled by a floor of n_networks).
+    pytest.importorskip('torch')
+    from nautilus import _torch
+    x, y, kwargs = _kernel_case(1000, 6)
+    kwargs = dict(kwargs, max_iter=300, n_iter_no_change=5)
+    nets = []
+    for floor in [4, 2]:
+        monkeypatch.setattr(_torch, '_MIN_STACK', floor)
+        nets.append(_torch.train_networks(x, y, 4, kwargs, 'cpu', 3))
+    assert len(set(net.n_iter_ for net in nets[0])) > 1
+    for a, b in zip(*nets):
+        assert a.n_iter_ == b.n_iter_ and a.best_loss_ == b.best_loss_
+        assert a.loss_curve_ == b.loss_curve_
+        for u, v in zip(a.coefs_ + a.intercepts_, b.coefs_ + b.intercepts_):
+            assert np.array_equal(u, v)
