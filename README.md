@@ -64,6 +64,8 @@ Differences from 1.0.6 on the torch backend (by design, all within the method):
 So torch-backend runs are a different realisation of the same sampler, not bitwise copies of 1.0.6.
 
 ## Benchmarks
+![Wall time per run, split by phase, for vanilla nautilus 1.0.6 (1 core, pool of 4) and the fork (1 core, 1 GPU)](docs/fork/figs/headline.png)
+
 Settings: n_live 500, n_eff 2000, Nautilus defaults otherwise; synthetic problems with known evidence; LUMI (AMD EPYC
 CPU cores; one AMD MI250X GCD). Fork, 1 core = torch backend on the CPU, float64 networks, speed-up against vanilla
 run on the same node at the same time. Fork, 1 GPU = float32 networks with the fused kernels.
