@@ -5,6 +5,16 @@ All notable changes to nautilus will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6+gpu.1] - unofficial fork, unreleased
+
+Unofficial fork; see the README. Without a `backend` argument the sampler is nautilus 1.0.6 bit for bit.
+
+### Added
+- Optional PyTorch backend (`backend='torch'`, `device=...`): stacked network training, batched ellipsoid fits and
+  bound sampling on a GPU or on the CPU through PyTorch.
+- Optional fused HIP kernels for AMD GPUs (`DRAW_KERNEL`, `TRAIN_KERNEL`) with a persistent kernel cache.
+- Benchmarks against nautilus 1.0.6 in `docs/fork/BENCHMARKS.md`.
+
 ## [1.0.6] - 2025-12-29
 
 ### Added
